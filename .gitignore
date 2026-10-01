@@ -1,0 +1,22 @@
+# Virtualenvs — both spellings. run.sh creates .venv/, so that one must be
+# ignored too or the whole environment lands in git.
+/venv/
+/.venv/
+/.idea
+**/__pycache__/
+**/.pytest_cache/
+/.ipynb_checkpoints/
+**/output/
+**/.DS_Store
+*.pyc
+*.egg-info/
+.env
+dist
+
+# Generated job-link reports. Timestamped on every run, so they would bloat the
+# history. Delete this line if you want to commit sample reports instead.
+/saved/
+
+# Personal resume/profile — contains contact details. Keep it on disk, never
+# commit it. The pipeline reads it from here at runtime.
+/resume.md
