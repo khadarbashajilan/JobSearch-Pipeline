@@ -35,7 +35,8 @@ This started as a clone of JobSpy. What I added on top:
 The profile-maintenance workflow is captured in an opencode skill at
 `.opencode/skills/job-search-profile/SKILL.md` (committed in this repo). The
 `resume.md` itself is gitignored — it contains personal contact details — but
-the skill file documents the full profile contract and how it is maintained.
+the skill file documents the full profile contract and how it is maintained
+(see [Maintaining the profile](#maintaining-the-profile-with-the-opencode-skill)).
 
 ## Usage
 
@@ -118,6 +119,31 @@ indeed = '"Gen AI" (Python OR FastAPI OR LLM)'
 
 TOML rather than comma-separated prose because values legitimately contain
 commas (`location = "Bengaluru, India"`) and quotes.
+
+### Maintaining the profile with the opencode skill
+
+The repo ships an [opencode](https://opencode.ai) skill at
+`.opencode/skills/job-search-profile/SKILL.md` that keeps the TOML profile in
+`resume.md` in sync with your actual resume.
+
+Use it by asking opencode to update your job search profile — for example,
+*"update my job search profile"*, *"refresh my job targets"*, or *"what will
+run.sh search for"*. The skill will:
+
+1. Read `resume.md` in full.
+2. Rewrite **only** the fenced `toml` block under `## Job Search Profile`,
+   leaving the rest of the resume untouched.
+3. Never invent skills or titles the resume does not evidence — if your actual
+   target differs from what the resume shows, it asks before changing anything.
+4. Derive titles, location, keywords, and exclusions from the resume content,
+   keeping `keywords.core` at ~6 entries in descending significance.
+5. Report what changed and the exact queries it will produce per site.
+
+Verify any change without touching a job board:
+
+```bash
+./run.sh --dry-run    # prints the derived queries, scrapes nothing
+```
 
 ## Design notes
 
