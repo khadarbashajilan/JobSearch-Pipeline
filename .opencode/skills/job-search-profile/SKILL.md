@@ -144,8 +144,21 @@ page for Bengaluru, radius 50, `hours_old = 72`.
 ## When to run this skill
 
 Trigger on: resume content changed, a title/skill/location was added or removed, the
-user asks what `run.sh` will search for, or the user reports `run.sh` failing with a
-profile validation error.
+user asks what `run.sh` will search for, the user reports `run.sh` failing with a
+profile validation error, **or the user asks to narrow by seniority** (e.g. *"only
+show me junior roles"*, *"filter to entry-level"*, *"I want senior+ only"*, *"stop
+showing me senior jobs"*, *"level filter"*, *"targeting senior only"*). For seniority
+requests, change `keywords.level_filter` to the matching tier (default is `off`):
+
+| User intent | Setting |
+|---|---|
+| *"junior / entry-level only"*, *"only entry-level"*, *"filter to junior"*, *"I want my first AI job"* | `level_filter = "junior"` |
+| *"mid-level roles"*, *"2–5 years experience"* | `level_filter = "mid"` |
+| *"senior roles"*, *"senior+"* | `level_filter = "senior"` |
+| *"include staff / principal"*, *"no level ceiling"* | `level_filter = "off"` |
+
+Confirm by running `./run.sh --dry-run` and showing the user the new
+`level filter` line.
 
 ## How to update the block
 
