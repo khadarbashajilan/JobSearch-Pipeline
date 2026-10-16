@@ -40,6 +40,12 @@ employment_types = ["full_time"]     # full_time, part_time, contract, temporary
 core    = ["Python", "FastAPI", "LangChain", "RAG", "LLM", "React"]
 exclude = ["Senior", "Lead", "Principal", "Staff", "Manager"]
 
+# Toggle this whenever your situation changes. ``off`` disables the
+# level filter; the other values are the *maximum* level the user is
+# willing to consider (jobs above it are filtered before matching).
+# Valid: off | intern | junior | mid | senior | lead | staff | principal
+level_filter = "junior"
+
 [experience]
 years = 4
 
@@ -66,6 +72,7 @@ model    = ""
 | `search.indeed_date_filter` | no | Default `false`. When `true`, *also* passes `hours_old` to Indeed's own server-side filter. Off by default because it halves results in a thin market. |
 | `keywords.core` | yes (min 2) | **Ordered by significance.** First 6 feed the plain query. Put the strongest signal first. |
 | `keywords.exclude` | no | Dropped from job **titles** client-side. Applies to every site, LinkedIn included. Whole-word match — `"Java"` will not match `"JavaScript"`. |
+| `keywords.level_filter` | no | Seniority ceiling. `off` (default) keeps every job. `intern` / `junior` / `mid` / `senior` / `lead` / `staff` / `principal` drop jobs whose inferred level ranks above the setting. Director / Head / VP / Chief titles are treated as senior-tier. Unstated seniority passes through. |
 | `experience.years` | no | Years of relevant experience. Used to estimate seniority fit. Optional. |
 | `matching.min_score` | no | Jobs scoring below this (0.0–1.0) are hidden from the report. Default 0.0. |
 | `llm.provider` / `llm.model` | no | Reserved. Currently unused; matching is fully deterministic. Set only when the LLM integration is enabled. |
@@ -158,7 +165,11 @@ profile validation error.
    (`Senior`, `Lead`, `Principal`, `Staff`, `Manager`) rather than dropping roles, so
    the target title stays a single clean phrase. These are matched against job titles
    locally, so they cost result *rows*, not query quality — but see the Indeed table
-   above, where five excludes took 8 rows to 1.
+   above, where five excludes took 8 rows to 1. For a hard ceiling (e.g. only junior
+   and entry-level roles reach the report), use `keywords.level_filter = "junior"`
+   instead — that drops mid/senior/lead/staff/principal/director/head/VP titles
+   before matching. Switch back to `level_filter = "off"` when targeting more senior
+   roles.
 7. `queries.indeed` is the knob that widens the pool when Indeed looks thin. Widen the
    `OR` group or drop the quoted phrase there. Do not reach for `keywords.core` instead.
 8. Report back: what changed, and the exact queries it produces per site.

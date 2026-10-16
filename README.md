@@ -78,6 +78,12 @@ employment_types    = ["full_time"]   # full_time, part_time, contract, internsh
 core    = ["Python", "FastAPI", "LangChain", "RAG", "LLM"]
 exclude = ["Senior", "Lead", "Principal", "Staff", "Manager"]
 
+# Toggle this whenever your situation changes. ``off`` disables the
+# level filter; the other values are the *maximum* level you're willing
+# to consider (jobs above it are filtered before matching).
+# Valid: off | intern | junior | mid | senior | lead | staff | principal
+level_filter = "junior"
+
 [experience]
 years = 4
 
@@ -122,6 +128,24 @@ specifically for this purpose.
   the candidate's skills. It is not configured by default and is reserved
   for future semantic matching. Add credentials only when you choose to
   enable it.
+
+## Filtering and freshness
+
+Three filters run locally on every job regardless of source:
+
+1. **Date window** — drops jobs posted before `hours_old`. Undated jobs
+   are kept and labelled "posted date unknown".
+2. **Title exclusions** — `keywords.exclude` drops roles whose title
+   contains any excluded token as a whole word.
+3. **Level filter** — `keywords.level_filter` drops roles whose
+   inferred seniority ranks above the setting. `off` (the default)
+   disables the filter entirely. With `level_filter = "junior"`, the
+   report shows only intern, junior, entry-level, and undated-seniority
+   roles — mid, senior, lead, staff, principal, director, head, and VP
+   titles are filtered before matching.
+
+Each job in the report carries a `level: <tier>` line so the
+classification that drove the filter is visible.
 
 ## Verification and matching
 

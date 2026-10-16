@@ -103,3 +103,45 @@ def test_load_profile_rejects_unknown_country(tmp_path: Path) -> None:
     )
     with pytest.raises(ProfileError, match="search.country"):
         load_profile(bad)
+
+
+def test_load_profile_accepts_level_filter(tmp_path: Path) -> None:
+    md = tmp_path / "level.md"
+    md.write_text(
+        "## Job Search Profile\n\n```toml\n"
+        "[titles]\nprimary = \"X\"\n"
+        "[search]\nlocation = \"Here\"\n"
+        "[keywords]\ncore = [\"a\", \"b\"]\nlevel_filter = \"junior\"\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    profile = load_profile(md)
+    assert profile.level_filter == "junior"
+
+
+def test_load_profile_defaults_level_filter_to_off(tmp_path: Path) -> None:
+    md = tmp_path / "default.md"
+    md.write_text(
+        "## Job Search Profile\n\n```toml\n"
+        "[titles]\nprimary = \"X\"\n"
+        "[search]\nlocation = \"Here\"\n"
+        "[keywords]\ncore = [\"a\", \"b\"]\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    profile = load_profile(md)
+    assert profile.level_filter == "off"
+
+
+def test_load_profile_rejects_invalid_level_filter(tmp_path: Path) -> None:
+    md = tmp_path / "bad_level.md"
+    md.write_text(
+        "## Job Search Profile\n\n```toml\n"
+        "[titles]\nprimary = \"X\"\n"
+        "[search]\nlocation = \"Here\"\n"
+        "[keywords]\ncore = [\"a\", \"b\"]\nlevel_filter = \"executive\"\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ProfileError, match="keywords.level_filter"):
+        load_profile(md)

@@ -135,9 +135,12 @@ def run_pipeline(
         stored,
         hours_old=profile.hours_old,
         exclude_keywords=profile.exclude_keywords,
+        level_filter=profile.level_filter,
     )
     report.filtered_out = (
-        stats.dropped_outside_window + stats.dropped_excluded_title
+        stats.dropped_outside_window
+        + stats.dropped_excluded_title
+        + stats.dropped_level_above
     )
 
     matches = rank_matches(filtered, profile)

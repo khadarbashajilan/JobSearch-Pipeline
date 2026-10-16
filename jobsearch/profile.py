@@ -32,6 +32,11 @@ NEXT_HEADING = re.compile(r"^##\s+\S", re.M)
 MAX_CORE_KEYWORDS = 6
 DEFAULT_HOURS_OLD = 168  # 7 days
 
+# Allowed settings for ``keywords.level_filter``. ``off`` is the default and
+# means no level-based cutoff; the others are the maximum level the user is
+# willing to consider, evaluated against ``_SENIORITY_RANK`` in matching.
+LEVEL_FILTER_VALUES = frozenset({"off", "intern", "junior", "mid", "senior", "lead", "staff", "principal"})
+
 
 @dataclass
 class CandidateProfile:
@@ -41,6 +46,7 @@ class CandidateProfile:
     alternative_titles: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
     exclude_keywords: tuple[str, ...] = ()
+    level_filter: str = "off"  # off | intern | junior | mid | senior | lead | staff | principal
     location: str = ""
     country: str = "USA"
     remote_preference: str = "any"  # onsite | remote | hybrid | any
@@ -176,11 +182,22 @@ def _build_profile(data: dict[str, Any]) -> CandidateProfile:
     llm_provider = _opt_str(data.get("llm") or {}, "provider", None)
     llm_model = _opt_str(data.get("llm") or {}, "model", None)
 
+    # ``level_filter`` is the seniority ceiling. ``off`` means no cutoff.
+    # When set, jobs whose inferred level ranks above this value are dropped
+    # before matching.
+    level_filter = _opt_str(data.get("keywords") or {}, "level_filter", "off") or "off"
+    if level_filter not in LEVEL_FILTER_VALUES:
+        raise ProfileError(
+            f"keywords.level_filter: expected one of "
+            f"{', '.join(sorted(LEVEL_FILTER_VALUES))}, got '{level_filter}'"
+        )
+
     return CandidateProfile(
         primary_title=primary.strip(),
         alternative_titles=tuple(t.strip() for t in alt_titles if t.strip()),
         skills=tuple(k.strip() for k in core_keywords if k.strip()),
         exclude_keywords=tuple(e.strip() for e in exclude if e.strip()),
+        level_filter=level_filter,
         location=location,
         country=country,
         jobspy_country=_resolve_jobspy_country(country),

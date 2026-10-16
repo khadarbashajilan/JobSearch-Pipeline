@@ -97,6 +97,8 @@ def render(
         applied.append(f"posted within last {profile.hours_old}h")
     if profile.exclude_keywords:
         applied.append("title exclusions: " + ", ".join(profile.exclude_keywords))
+    if profile.level_filter and profile.level_filter != "off":
+        applied.append(f"level_filter={profile.level_filter}")
     if applied:
         lines.append("**Applied locally:** " + " · ".join(applied))
         lines.append("")
@@ -156,6 +158,15 @@ def _render_job(
         bits.append(f"- matched: {', '.join(match.matched_skills)}")
     if match.missing_skills:
         bits.append(f"- missing: {', '.join(match.missing_skills)}")
+
+    # Surface the inferred seniority so the level-filter knob is auditable
+    # in the report — when ``level_filter`` is set, you can see exactly
+    # why each kept job was allowed through.
+    from jobsearch.filtering import infer_level
+
+    inferred = infer_level(job.title)
+    if inferred:
+        bits.append(f"- level: `{inferred}`")
 
     bits.append(f"- source: `{job.source}` · verification: `{job.link_status.value}`")
     if job.link_evidence:

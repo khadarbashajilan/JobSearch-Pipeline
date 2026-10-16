@@ -138,6 +138,7 @@ def _cmd_search(args: argparse.Namespace) -> int:
         print(f"  employment types  : {', '.join(profile.employment_types)}")
         print(f"  skills            : {', '.join(profile.skills)}")
         print(f"  excludes          : {', '.join(profile.exclude_keywords) or '-'}")
+        print(f"  level filter      : {profile.level_filter}")
         print(f"  min score         : {profile.min_score}")
         print()
         print("derived queries:")
@@ -158,6 +159,7 @@ def _cmd_search(args: argparse.Namespace) -> int:
         stored,
         hours_old=profile.hours_old,
         exclude_keywords=profile.exclude_keywords,
+        level_filter=profile.level_filter,
     )
 
     db_path = _db_path(args)
@@ -271,6 +273,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
             "alternative_titles": list(profile.alternative_titles),
             "skills": list(profile.skills),
             "exclude_keywords": list(profile.exclude_keywords),
+            "level_filter": profile.level_filter,
             "location": profile.location,
             "country": profile.country,
             "jobspy_country": profile.jobspy_country,
