@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Iterable
 
 from jobsearch.filtering import FilterStats
+from jobsearch.links import dork_query, google_dork_url, google_search_url, plain_query
 from jobsearch.models import (
     ApplicationStatus,
     JobMatch,
@@ -175,6 +176,9 @@ def _render_job(
         bits.append(f"- apply URL: {_cell(job.apply_url)}")
     elif job.source_url:
         bits.append(f"- source URL: {_cell(job.source_url)}")
+    if job.company or job.title:
+        bits.append(f"- Google search: [{plain_query(job)}]({google_search_url(job)})")
+        bits.append(f"- Google dork: [{dork_query(job)}]({google_dork_url(job)})")
     if job.application_status != ApplicationStatus.NEW:
         bits.append(f"- application status: `{job.application_status.value}`")
     if is_returning:

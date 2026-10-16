@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from jobsearch import store
+from jobsearch import export, store
 from jobsearch.errors import JobSearchError
 from jobsearch.models import ApplicationStatus, LinkStatus, StoredJob
 from jobsearch.orchestrate import run_pipeline
@@ -22,7 +24,11 @@ from jobsearch.queries import build_queries, parse_sites
 from jobsearch.report import render as render_report
 from jobsearch.verify import verify_url
 
-_KNOWN_COMMANDS = ("list", "status", "inspect", "doctors")
+_KNOWN_COMMANDS = ("list", "status", "inspect", "doctors", "rclone")
+
+_JOBS_DIR = Path("saved/")
+_DEFAULT_RCLONE_REMOTE = "gdrive"
+_DEFAULT_RCLONE_DEST = "Saved_Jobs"
 
 
 def _shared_flags() -> argparse.ArgumentParser:
@@ -31,22 +37,49 @@ def _shared_flags() -> argparse.ArgumentParser:
     Kept around so future subparsers can opt in via ``parents=[...]``
     without duplicating declarations.
     """
+    # ``argparse.SUPPRESS`` (rather than a concrete default) lets a shared flag
+    # appear *before* a subcommand without the subparser's own default
+    # overwriting the value the main parser already parsed. Concrete defaults
+    # are applied in :func:`_apply_defaults` after parsing completes.
     parent = argparse.ArgumentParser(add_help=False)
-    parent.add_argument("--resume", default="resume.md")
-    parent.add_argument("--db", default=None)
-    parent.add_argument("--out-dir", default="saved")
-    parent.add_argument("--site", default=None)
-    parent.add_argument("--location", default=None)
-    parent.add_argument("--country", default=None)
-    parent.add_argument("--results", type=int, default=None)
-    parent.add_argument("--hours-old", type=int, default=None)
-    parent.add_argument("--retries", type=int, default=1)
-    parent.add_argument("-v", "--verbose", type=int, default=0, choices=[0, 1, 2])
-    parent.add_argument("--dry-run", action="store_true", default=False)
-    parent.add_argument("--no-verify", action="store_true", default=False)
-    parent.add_argument("--min-score", type=float, default=None)
-    parent.add_argument("--no-persist", action="store_true", default=False)
+    parent.add_argument("--resume", default=argparse.SUPPRESS)
+    parent.add_argument("--db", default=argparse.SUPPRESS)
+    parent.add_argument("--out-dir", default=argparse.SUPPRESS)
+    parent.add_argument("--site", default=argparse.SUPPRESS)
+    parent.add_argument("--location", default=argparse.SUPPRESS)
+    parent.add_argument("--country", default=argparse.SUPPRESS)
+    parent.add_argument("--results", type=int, default=argparse.SUPPRESS)
+    parent.add_argument("--hours-old", type=int, default=argparse.SUPPRESS)
+    parent.add_argument("--retries", type=int, default=argparse.SUPPRESS)
+    parent.add_argument("-v", "--verbose", type=int, default=argparse.SUPPRESS, choices=[0, 1, 2])
+    parent.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
+    parent.add_argument("--no-verify", action="store_true", default=argparse.SUPPRESS)
+    parent.add_argument("--min-score", type=float, default=argparse.SUPPRESS)
+    parent.add_argument("--no-persist", action="store_true", default=argparse.SUPPRESS)
     return parent
+
+
+def _apply_defaults(args: argparse.Namespace) -> None:
+    """Fill in the concrete defaults for shared flags using ``SUPPRESS``.
+
+    Kept separate from ``_shared_flags`` so every consumer gets identical
+    fallbacks regardless of whether the flag came before or after the
+    subcommand.
+    """
+    args.resume = getattr(args, "resume", "resume.md")
+    args.db = getattr(args, "db", None)
+    args.out_dir = getattr(args, "out_dir", "saved")
+    args.site = getattr(args, "site", None)
+    args.location = getattr(args, "location", None)
+    args.country = getattr(args, "country", None)
+    args.results = getattr(args, "results", None)
+    args.hours_old = getattr(args, "hours_old", None)
+    args.retries = getattr(args, "retries", 1)
+    args.verbose = getattr(args, "verbose", 0)
+    args.dry_run = getattr(args, "dry_run", False)
+    args.no_verify = getattr(args, "no_verify", False)
+    args.min_score = getattr(args, "min_score", None)
+    args.no_persist = getattr(args, "no_persist", False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--note", default=None)
     subparsers.add_parser("inspect", help="show parsed profile", parents=[shared])
     subparsers.add_parser("doctors", help="run diagnostics against the configuration", parents=[shared])
+    subparsers.add_parser("rclone", help="sync saved/ to the configured rclone remote", parents=[shared])
     return parser
 
 
@@ -85,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         argv = ["search", "--dry-run"]  # default: dry-run prints the profile
     args = parser.parse_args(argv)
+    _apply_defaults(args)
     if args.command in (None, "search"):
         return _cmd_search(args)
     if args.command == "list":
@@ -95,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_inspect(args)
     if args.command == "doctors":
         return _cmd_doctors(args)
+    if args.command == "rclone":
+        return _cmd_rclone(args)
     parser.print_help()
     return 1
 
@@ -262,6 +299,71 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"updated {args.job_id} -> {status.value}")
+
+    # Best-effort: also write a per-job markdown under saved/. The
+    # SQLite write is the source of truth; if the markdown export fails the
+    # status change is still recorded, so we warn and continue.
+    db_path = _db_path(args)
+    job = next(
+        (row for row in store.list_jobs(limit=1000, path=db_path) if row.id == args.job_id),
+        None,
+    )
+    if job is not None:
+        try:
+            export.write_job_markdown(job, _JOBS_DIR)
+        except Exception as exc:  # noqa: BLE001 - export is best-effort
+            print(
+                f"warning: status updated but could not write {args.job_id}.md: {exc}",
+                file=sys.stderr,
+            )
+    return 0
+
+
+def _cmd_rclone(args: argparse.Namespace) -> int:
+    """Sync ``saved/`` to the configured rclone remote.
+
+    Reads ``JOBSEARCH_RCLONE_REMOTE`` (default ``gdrive``) and
+    ``JOBSEARCH_RCLONE_DEST`` (default ``Saved_Jobs``). Uses ``rclone sync``
+    with ``--delete-during`` so deletions on the local side propagate to the
+    remote. Local files are kept after a successful sync — Drive is a
+    one-way mirror, not the source of truth.
+
+    rclone failures propagate as a non-zero exit so transient network or
+    auth issues are visible, never silent.
+    """
+    remote = os.environ.get("JOBSEARCH_RCLONE_REMOTE", _DEFAULT_RCLONE_REMOTE)
+    dest = os.environ.get("JOBSEARCH_RCLONE_DEST", _DEFAULT_RCLONE_DEST)
+    src = _JOBS_DIR
+
+    if not src.exists() or not any(src.iterdir()):
+        print(
+            f"nothing to sync: {src} is missing or empty. "
+            f"Mark a job as 'saved' first to populate it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    target = f"{remote}:{dest}/"
+    print(f"syncing {src}/ -> {target}")
+    try:
+        subprocess.run(
+            ["rclone", "sync", str(src) + "/", target, "-v", "--delete-during"],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"error: rclone failed (exit {exc.returncode}). "
+            f"Run with `rclone sync {src}/ {target} -v --delete-during` to debug.",
+            file=sys.stderr,
+        )
+        return exc.returncode or 1
+    except FileNotFoundError:
+        print(
+            "error: rclone not found on PATH. Install it: "
+            "https://rclone.org/install/",
+            file=sys.stderr,
+        )
+        return 127
     return 0
 
 

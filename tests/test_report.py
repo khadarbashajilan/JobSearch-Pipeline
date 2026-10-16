@@ -55,6 +55,9 @@ def test_report_renders_title_and_url() -> None:
     assert "GenAI Developer" in output
     assert "https://example.com/x" in output
     assert "**Score:**" in output
+    assert "- Google search: [Acme GenAI Developer careers]" in output
+    assert '- Google dork: [site:example.com careers "GenAI Developer"]' in output
+    assert "https://www.google.com/search?q=" in output
 
 
 def test_report_marks_unknown_dates() -> None:

@@ -2,12 +2,14 @@
 name: job-search-profile
 description: >
   Maintain the machine-readable job-search profile block in resume.md so ./run.sh
-  scrapes correctly targeted listings. Use when the user edits their resume, adds or
-  removes a target job title, skill, keyword, or target location, changes seniority
-  level, or says "update my job search profile", "regenerate my job search profile",
-  "refresh my job targets", "what will run.sh search for". Rewrites ONLY the toml
-  block under "## Job Search Profile" in resume.md. Never edits the rest of the
-  resume and never invents skills the resume does not evidence.
+  scrapes correctly targeted listings. Trigger when the user edits their resume
+  (adds/removes a target title, skill, keyword, or location), changes seniority
+  level, says "update my job search profile", "regenerate my profile", "refresh
+  my job targets", asks how to narrow or widen seniority ("only junior roles",
+  "include staff/principal", "no level ceiling", "level filter"), or reports a
+  profile validation error from ./run.sh. Rewrites ONLY the toml block under
+  "## Job Search Profile" in resume.md. Never edits the rest of the resume and
+  never invents skills the resume does not evidence.
 ---
 
 ## What this does
@@ -25,8 +27,8 @@ fenced ```` ```toml ```` block. That block is the only thing `./run.sh` reads.
 
 ```toml
 [titles]
-primary = "GenAI Developer"
-also    = ["Generative AI Engineer", "AI Engineer", "LLM Engineer", "Python Developer"]
+primary = "Full-Stack Developer"
+also    = ["Full Stack Engineer", "Software Engineer", "Frontend Developer", "Backend Developer", "React Developer", "Python Developer"]
 
 [search]
 location         = "Bengaluru, India"
@@ -35,26 +37,32 @@ hours_old        = 72
 results_per_site = 30
 remote           = "any"             # onsite | remote | hybrid | any
 employment_types = ["full_time"]     # full_time, part_time, contract, temporary, internship
+# Set true to *also* pass hours_old to Indeed's own server-side date filter.
+# Off by default because it halves results in a thin market.
+indeed_date_filter = false
 
 [keywords]
-core    = ["Python", "FastAPI", "LangChain", "RAG", "LLM", "React"]
+core    = ["Python", "FastAPI", "React", "TypeScript", "PostgreSQL", "Docker"]
+# Matched against job titles by scrape.py, not sent to any board. Deliberate:
+# LinkedIn ignores -X outright, and on Indeed each exclusion sharply narrows
+# the pool (5 excludes took 8 rows down to 1 at 72h).
 exclude = ["Senior", "Lead", "Principal", "Staff", "Manager"]
-
-# Toggle this whenever your situation changes. ``off`` disables the
-# level filter; the other values are the *maximum* level the user is
-# willing to consider (jobs above it are filtered before matching).
+# Hard seniority ceiling. `junior` drops mid/senior/lead/staff/principal/director/head/VP
+# titles before matching. Switch to "off" to widen.
 # Valid: off | intern | junior | mid | senior | lead | staff | principal
 level_filter = "junior"
 
 [experience]
-years = 4
+years = 1   # optional; used to estimate seniority fit
 
 [matching]
 min_score = 0.0    # jobs below this score are dropped from the report
 
-[llm]
-provider = ""      # optional, reserved for future LLM-assisted matching
-model    = ""
+[queries]
+# Override the boolean query sent to Indeed. Omit to derive from titles + core.
+# The default derived form DOES include -<exclude…> terms, which is why 5
+# excludes can take 8 rows to 1 — see "Hard-won site constraints" below.
+indeed = 'Full-Stack (Python OR React OR TypeScript OR FastAPI OR PostgreSQL)'
 ```
 
 ### Field semantics
@@ -88,15 +96,16 @@ combined results locally by date and by title.
 **Every other site** — `titles.primary` + every `keywords.core` entry + every
 `titles.also` entry. Alternative titles do extend the pool.
 
-`keywords.exclude` is deliberately **not** sent to any board as a `-X` term, and the
-date window is applied locally for every site. That is a uniformity choice, not a
-patch for a broken API — the two reasons are in the constraints below: LinkedIn
-ignores `-X` outright, and on Indeed each exclusion sharply narrows an already thin
-pool. `date_posted` and `title` come back reliably from every site, so filtering once,
-locally, is the only approach that behaves the same everywhere.
+`keywords.exclude` is sent to Indeed as `-X` terms by the default derived query
+(see `jobsearch/queries.py`), and that is the single reason a 5-exclude set takes
+8 rows to 1. It is **also** applied locally to job titles on every site, so
+LinkedIn (which ignores `-X` outright) still benefits from the title filter.
+`queries.indeed` is the user's escape hatch: setting it overrides the derived
+form, and the project's convention is to leave excludes *out* of the override
+string to keep the pool wider.
 
 Do not put boolean operators into `keywords.core` or `titles.*`. Values are keywords
-and titles, nothing else.
+and titles, nothing else. `queries.indeed` is the only place boolean syntax lives.
 
 ## Hard-won site constraints
 
@@ -159,6 +168,15 @@ requests, change `keywords.level_filter` to the matching tier (default is `off`)
 
 Confirm by running `./run.sh --dry-run` and showing the user the new
 `level filter` line.
+
+| User intent | Setting |
+|---|---|
+| *"intern / first job"*, *"internship only"* | `level_filter = "intern"` |
+| *"junior / entry-level only"*, *"only entry-level"*, *"filter to junior"*, *"I want my first AI job"* | `level_filter = "junior"` |
+| *"mid-level roles"*, *"2–5 years experience"* | `level_filter = "mid"` |
+| *"senior roles"*, *"senior+"* | `level_filter = "senior"` |
+| *"lead / staff only"*, *"lead roles"* | `level_filter = "lead"` |
+| *"include staff / principal"*, *"no level ceiling"*, *"open to anything"*, *"stop filtering by level"* | `level_filter = "off"` |
 
 ## How to update the block
 
