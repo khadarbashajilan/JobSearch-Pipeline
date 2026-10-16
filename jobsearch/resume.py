@@ -123,3 +123,52 @@ def _parse_json(text: str) -> ParsedResume:
         education=tuple(data.get("education") or ()),
         work_history=tuple(data.get("work_history") or ()),
     )
+
+_SECTION_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+_BOLD_LABEL_RE = re.compile(r"^\*\*[^*]+\*\*\s*:?\s*|^[^:,]{1,60}:\s+")
+
+
+def find_skills_heading(markdown: str, exclude: tuple[str, ...] = ()) -> str | None:
+    """Return the first ``## `` heading whose text mentions "skill"."""
+    for match in _SECTION_HEADING_RE.finditer(markdown):
+        heading = match.group(1).strip()
+        if "skill" in heading.lower() and heading.lower() not in {e.lower() for e in exclude}:
+            return heading
+    return None
+
+
+def extract_section_skills(markdown: str, heading: str) -> tuple[str, ...]:
+    """Pull a flat skill list out of one ``## <heading>`` section.
+
+    Each bullet may carry a label (``- **Frontend:** React, Vite``); the
+    label is dropped and the remainder is split on commas. Parenthetical
+    qualifiers stay in the value — :func:`textnorm.skill_variants` handles
+    them at match time so the report shows the résumé's own wording.
+    Returns ``()`` when the heading is absent.
+    """
+    if not heading:
+        return ()
+    pattern = re.compile(rf"^##\s+{re.escape(heading)}\s*$", re.MULTILINE | re.IGNORECASE)
+    start = pattern.search(markdown)
+    if not start:
+        return ()
+    body = markdown[start.end():]
+    nxt = re.search(r"^#{1,2}\s+\S", body, re.MULTILINE)
+    section = body[: nxt.start()] if nxt else body
+
+    skills: list[str] = []
+    seen: set[str] = set()
+    for line in section.splitlines():
+        stripped = line.strip()
+        bullet = re.match(r"^[-*•]\s+", stripped)
+        if not bullet:
+            continue
+        value = stripped[bullet.end():].strip()
+        value = _BOLD_LABEL_RE.sub("", value, count=1)
+        # Commas inside parentheses ("Go (Gin, Echo)") are not separators.
+        for item in re.split(r",(?![^()]*\))", value):
+            item = item.strip().strip("*_`").strip()
+            if item and item.lower() not in seen:
+                seen.add(item.lower())
+                skills.append(item)
+    return tuple(skills)

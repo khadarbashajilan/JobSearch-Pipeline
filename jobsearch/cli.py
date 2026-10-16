@@ -17,16 +17,16 @@ from pathlib import Path
 
 from jobsearch import export, store
 from jobsearch.errors import JobSearchError
+from jobsearch.matching import candidate_level
 from jobsearch.models import ApplicationStatus, LinkStatus, StoredJob
 from jobsearch.orchestrate import run_pipeline
 from jobsearch.profile import load_profile
 from jobsearch.queries import build_queries, parse_sites
 from jobsearch.report import render as render_report
-from jobsearch.verify import verify_url
+from jobsearch.verify import VerifyConfig, verify_many
 
 _KNOWN_COMMANDS = ("list", "status", "inspect", "doctors", "rclone")
 
-_JOBS_DIR = Path("saved/")
 _DEFAULT_RCLONE_REMOTE = "gdrive"
 _DEFAULT_RCLONE_DEST = "Saved_Jobs"
 
@@ -46,7 +46,8 @@ def _shared_flags() -> argparse.ArgumentParser:
     parent.add_argument("--db", default=argparse.SUPPRESS)
     parent.add_argument("--out-dir", default=argparse.SUPPRESS)
     parent.add_argument("--site", default=argparse.SUPPRESS)
-    parent.add_argument("--location", default=argparse.SUPPRESS)
+    parent.add_argument("--location", default=argparse.SUPPRESS,
+                        help='override search locations; separate several with ";"')
     parent.add_argument("--country", default=argparse.SUPPRESS)
     parent.add_argument("--results", type=int, default=argparse.SUPPRESS)
     parent.add_argument("--hours-old", type=int, default=argparse.SUPPRESS)
@@ -74,7 +75,7 @@ def _apply_defaults(args: argparse.Namespace) -> None:
     args.country = getattr(args, "country", None)
     args.results = getattr(args, "results", None)
     args.hours_old = getattr(args, "hours_old", None)
-    args.retries = getattr(args, "retries", 1)
+    args.retries = getattr(args, "retries", None)
     args.verbose = getattr(args, "verbose", 0)
     args.dry_run = getattr(args, "dry_run", False)
     args.no_verify = getattr(args, "no_verify", False)
@@ -146,7 +147,10 @@ def _load_profile_or_exit(args: argparse.Namespace):
 
 def _resolve_profile_overrides(args: argparse.Namespace, profile) -> None:
     if args.location:
-        profile.location = args.location
+        # --location replaces the profile's list for this run; commas are
+        # part of a location ("Chennai, India"), so separate several with ";".
+        profile.locations = tuple(l.strip() for l in args.location.split(";") if l.strip())
+        profile.location = profile.locations[0]
     if args.country:
         profile.country = args.country
         profile.jobspy_country = args.country
@@ -156,48 +160,65 @@ def _resolve_profile_overrides(args: argparse.Namespace, profile) -> None:
         profile.hours_old = args.hours_old
     if getattr(args, "min_score", None) is not None:
         profile.min_score = args.min_score
+    if getattr(args, "retries", None) is not None:
+        profile.retries = max(0, args.retries)
 
 
 def _cmd_search(args: argparse.Namespace) -> int:
     profile = _load_profile_or_exit(args)
     _resolve_profile_overrides(args, profile)
-    sites = parse_sites(args.site or "indeed,linkedin")
+    try:
+        sites = parse_sites(args.site) if args.site else list(profile.sites)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     if args.dry_run:
         print(f"profile: {args.resume}")
         print(f"  primary title     : {profile.primary_title}")
         print(f"  alternative titles: {', '.join(profile.alternative_titles) or '-'}")
-        print(f"  location          : {profile.location}")
+        print(f"  locations         : {'; '.join(profile.locations or (profile.location,))}")
+        print(f"  kept regions      : {', '.join(profile.allowed_regions) or '- (any)'}")
+        print(f"  keep remote/unknown: {profile.keep_remote} / {profile.keep_unknown_location}")
         print(f"  country           : {profile.jobspy_country}")
         print(f"  results per site  : {profile.results_per_site}")
         print(f"  hours old         : {profile.hours_old}")
         print(f"  remote preference : {profile.remote_preference}")
         print(f"  employment types  : {', '.join(profile.employment_types)}")
-        print(f"  skills            : {', '.join(profile.skills)}")
+        print(f"  core keywords     : {', '.join(profile.core_keywords) or '-'}")
+        print(f"  skills (matching) : {', '.join(profile.skills)}")
+        print(f"  watched skills    : {', '.join(profile.watch_skills) or '-'}")
         print(f"  excludes          : {', '.join(profile.exclude_keywords) or '-'}")
-        print(f"  level filter      : {profile.level_filter}")
+        print(f"  stack excludes    : {', '.join(profile.exclude_stack) or '-'}")
+        print(f"  level band        : {profile.level_min} → {profile.level_filter}"
+              f"{' (strict)' if profile.level_strict else ''}")
+        print(f"  candidate level   : {candidate_level(profile) or '-'}")
+        print(f"  experience years  : {_fmt_num(profile.experience_years)}")
+        print(f"  max years required: {_fmt_num(profile.max_required_years)}")
         print(f"  min score         : {profile.min_score}")
+        print(f"  retries           : {profile.retries} (backoff {profile.retry_backoff_seconds:g}s)")
+        print(f"  parallel sources  : {profile.parallel_sources}")
+        print(f"  linkedin details  : {profile.linkedin_fetch_description}")
+        print(f"  verify            : {profile.verify_enabled} ({profile.verify_workers} workers)")
         print()
         print("derived queries:")
         for label, query in build_queries(profile).items():
             print(f"  {label:<8} {query}")
         print()
-        print(f"sites: {', '.join(sites)}")
+        from jobsearch.orchestrate import build_source_requests, skipped_sources
+
+        pairs = build_source_requests(profile, sites)
+        print(f"sites: {', '.join(sites)}  ({len(pairs)} searches)")
+        for diag in skipped_sources(sites):
+            print(f"  {diag.source}: {diag.error}")
         return 0
 
     stored, matches, report = run_pipeline(profile, sites)
 
-    if not args.no_verify:
-        _verify_jobs(stored)
+    if profile.verify_enabled and not args.no_verify:
+        _verify_jobs(stored, _verify_config(profile))
 
-    from jobsearch.filtering import filter_jobs
-
-    _, filter_stats = filter_jobs(
-        stored,
-        hours_old=profile.hours_old,
-        exclude_keywords=profile.exclude_keywords,
-        level_filter=profile.level_filter,
-    )
+    filter_stats = report.filter_stats
 
     db_path = _db_path(args)
     previous_ids = (
@@ -231,19 +252,35 @@ def _cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
-def _verify_jobs(jobs: list) -> None:
-    """Best-effort URL verification for the jobs we just discovered."""
-    for job in jobs:
-        if not isinstance(job, StoredJob):
-            continue
-        if job.link_status != LinkStatus.UNVERIFIED:
-            continue
-        url = job.apply_url or job.official_url or job.source_url
-        if not url:
-            continue
-        try:
-            result = verify_url(url)
-        except Exception:  # noqa: BLE001 - verification is best-effort
+def _fmt_num(value: float | None) -> str:
+    return "-" if value is None else f"{value:g}"
+
+
+def _verify_config(profile) -> VerifyConfig:
+    return VerifyConfig(
+        timeout=profile.verify_timeout,
+        uncertain_hosts=profile.verify_uncertain_hosts,
+        login_markers=profile.verify_login_markers,
+        expired_phrases=profile.verify_expired_phrases,
+        workers=profile.verify_workers,
+    )
+
+
+def _verify_jobs(jobs: list, config: VerifyConfig | None = None) -> None:
+    """Best-effort, concurrent URL verification for the jobs we just discovered.
+
+    Checks the vacancy link (``apply_url`` or ``source_url``), never
+    ``official_url``, which is the employer's page rather than the job.
+    """
+    pending = [
+        job for job in jobs
+        if isinstance(job, StoredJob)
+        and job.link_status == LinkStatus.UNVERIFIED
+        and (job.apply_url or job.source_url)
+    ]
+    results = verify_many([job.apply_url or job.source_url for job in pending], config)
+    for job, result in zip(pending, results):
+        if result is None:
             continue
         job.link_status = result.status
         job.link_evidence = result.evidence
@@ -263,7 +300,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     for row in rows:
         title = row.title or "untitled"
         company = row.company or "?"
-        url = row.apply_url or row.official_url or row.source_url
+        url = row.apply_url or row.source_url
         marker = f"[{row.application_status.value}]"
         print(f"{marker} {title} @ {company}")
         if url:
@@ -310,7 +347,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     )
     if job is not None:
         try:
-            export.write_job_markdown(job, _JOBS_DIR)
+            export.write_job_markdown(job, Path(args.out_dir))
         except Exception as exc:  # noqa: BLE001 - export is best-effort
             print(
                 f"warning: status updated but could not write {args.job_id}.md: {exc}",
@@ -333,7 +370,7 @@ def _cmd_rclone(args: argparse.Namespace) -> int:
     """
     remote = os.environ.get("JOBSEARCH_RCLONE_REMOTE", _DEFAULT_RCLONE_REMOTE)
     dest = os.environ.get("JOBSEARCH_RCLONE_DEST", _DEFAULT_RCLONE_DEST)
-    src = _JOBS_DIR
+    src = Path(args.out_dir)
 
     if not src.exists() or not any(src.iterdir()):
         print(
@@ -373,9 +410,35 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         {
             "primary_title": profile.primary_title,
             "alternative_titles": list(profile.alternative_titles),
+            "core_keywords": list(profile.core_keywords),
             "skills": list(profile.skills),
+            "watch_skills": list(profile.watch_skills),
             "exclude_keywords": list(profile.exclude_keywords),
+            "exclude_stack": list(profile.exclude_stack),
             "level_filter": profile.level_filter,
+            "level_min": profile.level_min,
+            "level_strict": profile.level_strict,
+            "locations": list(profile.locations),
+            "allowed_regions": list(profile.allowed_regions),
+            "keep_remote": profile.keep_remote,
+            "keep_unknown_location": profile.keep_unknown_location,
+            "parallel_sources": profile.parallel_sources,
+            "candidate_level": candidate_level(profile),
+            "level_aliases": profile.level_aliases,
+            "max_required_years": profile.max_required_years,
+            "sites": list(profile.sites),
+            "retries": profile.retries,
+            "retry_backoff_seconds": profile.retry_backoff_seconds,
+            "linkedin_fetch_description": profile.linkedin_fetch_description,
+            "verify": {
+                "enabled": profile.verify_enabled,
+                "workers": profile.verify_workers,
+                "timeout": profile.verify_timeout,
+                "uncertain_hosts": list(profile.verify_uncertain_hosts),
+                "login_markers": list(profile.verify_login_markers),
+                "expired_phrases": list(profile.verify_expired_phrases),
+            },
+            "report_previously_seen": profile.report_seen,
             "location": profile.location,
             "country": profile.country,
             "jobspy_country": profile.jobspy_country,
@@ -408,5 +471,15 @@ def _cmd_doctors(args: argparse.Namespace) -> int:
         warnings += 1
     if not profile.alternative_titles:
         print("note: titles.also is empty — only the primary title will be searched")
+    if profile.skills == profile.core_keywords:
+        print("note: no résumé skills section found — matching uses keywords.core only")
+    if not profile.watch_skills:
+        print("note: skills.watch is empty — reports can show matched skills but never missing ones")
+    if "linkedin" in profile.sites and not profile.linkedin_fetch_description:
+        print("warning: search.linkedin_fetch_description is false — LinkedIn jobs have no "
+              "description, so skills and years cannot be scored for them")
+        warnings += 1
+    if profile.experience_years is None:
+        print("note: experience.years is unset — experience fit is neutral for every job")
     print(f"doctors: {warnings} warning(s)")
     return 0

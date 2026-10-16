@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Iterable
 
-from jobsearch.filtering import FilterStats
+from jobsearch.filtering import FilterStats, infer_level, merge_level_aliases
 from jobsearch.links import dork_query, google_dork_url, google_search_url, plain_query
 from jobsearch.models import (
     ApplicationStatus,
@@ -61,8 +61,12 @@ def render(
     lines: list[str] = [
         f"# Job Search — {stamp:%Y-%m-%d %H:%M}",
         "",
-        f"**Location:** {_cell(profile.location)} · **Country:** {_cell(profile.jobspy_country)}",
+        f"**Searched:** {_cell(', '.join(profile.locations or (profile.location,)))} · **Country:** {_cell(profile.jobspy_country)}",
         "",
+    ]
+    if profile.allowed_regions:
+        lines += [f"**Kept regions:** {_cell(', '.join(profile.allowed_regions))}", ""]
+    lines += [
         f"**Titles:** {_cell(profile.primary_title)}"
         + (f" / alt: {_cell(', '.join(profile.alternative_titles))}" if profile.alternative_titles else ""),
         "",
@@ -98,10 +102,19 @@ def render(
         applied.append(f"posted within last {profile.hours_old}h")
     if profile.exclude_keywords:
         applied.append("title exclusions: " + ", ".join(profile.exclude_keywords))
-    if profile.level_filter and profile.level_filter != "off":
-        applied.append(f"level_filter={profile.level_filter}")
+    if profile.exclude_stack:
+        applied.append("stack exclusions: " + ", ".join(profile.exclude_stack))
+    band = _level_band(profile)
+    if band:
+        applied.append(band)
+    if profile.max_required_years is not None:
+        applied.append(f"max {profile.max_required_years:g} yrs required")
     if applied:
         lines.append("**Applied locally:** " + " · ".join(applied))
+        lines.append("")
+    dropped = _dropped_breakdown(filter_stats)
+    if dropped:
+        lines.append("**Dropped:** " + " · ".join(dropped))
         lines.append("")
 
     if report.queries:
@@ -119,21 +132,89 @@ def render(
         ]
         return "\n".join(lines) + "\n"
 
-    lines.append(f"## Ranked shortlist ({len(visible)})")
+    aliases = merge_level_aliases(profile.level_aliases)
+    fresh = [m for m in visible if m.job.id not in seen_ids]
+    returning = [m for m in visible if m.job.id in seen_ids]
+    if profile.report_seen == "full":
+        fresh, returning = visible, []
+
+    lines.append(f"## New ({len(fresh)})" if profile.report_seen != "full" else f"## Ranked shortlist ({len(fresh)})")
     lines.append("")
-    for index, match in enumerate(visible, start=1):
-        job = match.job
-        lines.extend(_render_job(index, job, match, match.job.id in seen_ids))
+    if not fresh:
+        lines += ["_Nothing new since the last run._", ""]
+    for index, match in enumerate(fresh, start=1):
+        is_returning = match.job.id in seen_ids
+        lines.extend(_render_job(index, match.job, match, is_returning, aliases))
+        lines.append("")
+
+    if returning and profile.report_seen == "compact":
+        lines.append(f"## Previously seen ({len(returning)})")
+        lines.append("")
+        for match in returning:
+            lines.append(_render_compact(match))
+        lines.append("")
+    elif returning and profile.report_seen == "hide":
+        lines.append(f"_{len(returning)} previously seen job(s) hidden (report.previously_seen = \"hide\")._")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _dropped_breakdown(stats: FilterStats) -> list[str]:
+    labels = (
+        ("dropped_outside_window", "too old"),
+        ("dropped_excluded_title", "title excluded"),
+        ("dropped_excluded_stack", "stack excluded"),
+        ("dropped_level_above", "above level"),
+        ("dropped_level_below", "below level"),
+        ("dropped_level_unknown", "level not stated (strict)"),
+        ("dropped_location", "outside regions"),
+        ("dropped_experience_above", "too many years required"),
+        ("dropped_hard_conflict", "hard conflict"),
+    )
+    return [f"{getattr(stats, attr)} {label}" for attr, label in labels if getattr(stats, attr)]
+
+
+def _level_band(profile: CandidateProfile) -> str:
+    low = profile.level_min if profile.level_min != "off" else ""
+    high = profile.level_filter if profile.level_filter != "off" else ""
+    if not low and not high:
+        return ""
+    if low == high:
+        text = f"level={low}"
+    else:
+        text = f"level {low or 'any'}–{high or 'any'}"
+    return text + (" (strict)" if profile.level_strict else "")
+
+
+def _job_link(job: StoredJob) -> str:
+    """Link to the vacancy itself; ``official_url`` is the employer page."""
+    return job.apply_url or job.source_url or ""
+
+
+def _render_compact(match: JobMatch) -> str:
+    job = match.job
+    title = _cell(job.title) or "untitled"
+    url = _job_link(job)
+    head = f"[{title}]({_cell(url)})" if url else title
+    company = f" · {_cell(job.company)}" if job.company else ""
+    status = (
+        f" · `{job.application_status.value}`"
+        if job.application_status != ApplicationStatus.NEW
+        else ""
+    )
+    return f"- {match.score:.2f} — {head}{company}{status}"
+
+
 def _render_job(
-    index: int, job: StoredJob, match: JobMatch, is_returning: bool
+    index: int,
+    job: StoredJob,
+    match: JobMatch,
+    is_returning: bool,
+    aliases: dict[str, str] | None = None,
 ) -> list[str]:
     title = _cell(job.title) or "untitled"
-    url = job.apply_url or job.official_url or job.source_url
+    url = _job_link(job)
     heading = f"### {index}. [{title}]({_cell(url)})" if url else f"### {index}. {title}"
 
     bits: list[str] = [heading]
@@ -163,19 +244,17 @@ def _render_job(
     # Surface the inferred seniority so the level-filter knob is auditable
     # in the report — when ``level_filter`` is set, you can see exactly
     # why each kept job was allowed through.
-    from jobsearch.filtering import infer_level
-
-    inferred = infer_level(job.title)
+    inferred = infer_level(job.title, aliases)
     if inferred:
         bits.append(f"- level: `{inferred}`")
 
     bits.append(f"- source: `{job.source}` · verification: `{job.link_status.value}`")
     if job.link_evidence:
         bits.append(f"- link evidence: {_cell(job.link_evidence)}")
-    if job.apply_url and job.apply_url != job.source_url:
-        bits.append(f"- apply URL: {_cell(job.apply_url)}")
-    elif job.source_url:
-        bits.append(f"- source URL: {_cell(job.source_url)}")
+    if job.apply_url and job.source_url and job.apply_url != job.source_url:
+        bits.append(f"- listing: {_cell(job.source_url)}")
+    if job.official_url and job.official_url not in (job.apply_url, job.source_url):
+        bits.append(f"- company page: {_cell(job.official_url)}")
     if job.company or job.title:
         bits.append(f"- Google search: [{plain_query(job)}]({google_search_url(job)})")
         bits.append(f"- Google dork: [{dork_query(job)}]({google_dork_url(job)})")

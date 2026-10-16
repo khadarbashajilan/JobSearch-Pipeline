@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Any, Iterable
 
 from jobsearch.models import RawJob
 
@@ -34,7 +34,7 @@ class SourceRequest:
     country: str
     hours_old: int | None
     results_wanted: int
-    extra: dict[str, str] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

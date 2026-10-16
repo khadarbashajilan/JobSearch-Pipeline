@@ -63,8 +63,12 @@ def _format_date(value) -> str:
 
 
 def _best_url(job) -> str:
-    """Return the most useful URL for a human reading the markdown."""
-    return job.apply_url or job.official_url or job.source_url or ""
+    """Return the link to the vacancy itself.
+
+    ``official_url`` is the employer's page (often a board company profile),
+    so it is never used as the job link.
+    """
+    return job.apply_url or job.source_url or ""
 
 
 def _render(job) -> str:

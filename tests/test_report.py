@@ -56,7 +56,8 @@ def test_report_renders_title_and_url() -> None:
     assert "https://example.com/x" in output
     assert "**Score:**" in output
     assert "- Google search: [Acme GenAI Developer careers]" in output
-    assert '- Google dork: [site:example.com careers "GenAI Developer"]' in output
+    # No employer domain known (only a board listing URL) → phrase dork.
+    assert '- Google dork: ["Acme" careers "GenAI Developer"]' in output
     assert "https://www.google.com/search?q=" in output
 
 
@@ -99,4 +100,38 @@ def test_report_marks_previously_seen() -> None:
     job = _job()
     match = JobMatch(job=job, score=0.8, matched_skills=(), missing_skills=(), hard_conflicts=(), explanation="")
     output = render([match], _profile(), RunReport(), FilterStats(kept=1), previously_seen_ids={job.id})
+    assert "## Previously seen (1)" in output
+    assert "## New (0)" in output
+
+
+def test_report_lists_new_jobs_before_seen_ones() -> None:
+    seen, fresh = _job("Old Role", "https://example.com/old"), _job("New Role", "https://example.com/new")
+    seen.id, fresh.id = "seen", "fresh"
+    matches = [
+        JobMatch(job=seen, score=0.9, matched_skills=(), missing_skills=(), hard_conflicts=(), explanation=""),
+        JobMatch(job=fresh, score=0.5, matched_skills=(), missing_skills=(), hard_conflicts=(), explanation=""),
+    ]
+    output = render(matches, _profile(), RunReport(), FilterStats(kept=2), previously_seen_ids={"seen"})
+    assert output.index("New Role") < output.index("Old Role")
+    assert "### 1. [New Role]" in output
+    assert "- 0.90 — [Old Role]" in output
+
+
+def test_report_full_mode_keeps_single_ranked_list() -> None:
+    profile = _profile()
+    profile.report_seen = "full"
+    job = _job()
+    match = JobMatch(job=job, score=0.8, matched_skills=(), missing_skills=(), hard_conflicts=(), explanation="")
+    output = render([match], profile, RunReport(), FilterStats(kept=1), previously_seen_ids={job.id})
+    assert "## Ranked shortlist (1)" in output
     assert "previously seen" in output
+
+
+def test_report_links_vacancy_not_company_page() -> None:
+    job = _job(url="https://www.linkedin.com/jobs/view/42")
+    job.official_url = "https://in.linkedin.com/company/acme"
+    match = JobMatch(job=job, score=0.8, matched_skills=(), missing_skills=(), hard_conflicts=(), explanation="")
+    output = render([match], _profile(), RunReport(), FilterStats(kept=1))
+    assert "### 1. [GenAI Developer](https://www.linkedin.com/jobs/view/42)" in output
+    assert "- company page: https://in.linkedin.com/company/acme" in output
+    assert "site:linkedin.com" not in output and "site:in.linkedin.com" not in output

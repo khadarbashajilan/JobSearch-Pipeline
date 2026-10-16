@@ -51,8 +51,10 @@ def parse_iso_datetime(value: object) -> datetime | None:
 def contains_any(haystack: str, needles: tuple[str, ...]) -> tuple[str, ...]:
     """Return the subset of ``needles`` found as whole tokens in ``haystack``.
 
-    "Whole token" means a word-boundary match after normalization, which
-    prevents "Java" matching "JavaScript" and similar substring traps.
+    "Whole token" means the needle is not flanked by word characters, which
+    prevents "Java" matching "JavaScript" and similar substring traps. It
+    uses look-arounds rather than ``\b`` so needles that start or end with
+    punctuation (".NET", "C++", "C#") still match.
     """
     if not haystack or not needles:
         return ()
@@ -62,6 +64,32 @@ def contains_any(haystack: str, needles: tuple[str, ...]) -> tuple[str, ...]:
         if not needle:
             continue
         token = needle.lower()
-        if re.search(rf"\b{re.escape(token)}\b", text):
+        if has_token(text, token):
             found.append(token)
     return tuple(found)
+
+
+def has_token(text: str, token: str) -> bool:
+    """True when ``token`` occurs in ``text`` as a whole token (case-insensitive)."""
+    if not text or not token:
+        return False
+    return re.search(rf"(?<!\w){re.escape(token.lower())}(?!\w)", text.lower()) is not None
+
+
+def skill_variants(skill: str) -> tuple[str, ...]:
+    """Spellings of ``skill`` worth searching for in a job description.
+
+    Parenthetical qualifiers are dropped ("JavaScript (ES6+)" → "JavaScript")
+    and a trailing ".js" is optional ("React.js" also matches "React"). The
+    rules are spelling-level only; anything vocabulary-level (synonyms such
+    as Postgres/PostgreSQL) belongs in ``skills.also`` in the profile.
+    """
+    base = re.sub(r"\([^)]*\)", " ", skill)
+    base = _WHITESPACE_RE.sub(" ", base).strip()
+    if not base:
+        return ()
+    variants = [base]
+    lowered = base.lower()
+    if lowered.endswith(".js") and len(base) > 3:
+        variants.append(base[:-3])
+    return tuple(dict.fromkeys(variants))

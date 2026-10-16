@@ -32,6 +32,8 @@ _SITE_MAP = {
     "bdjobs": Site.BDJOBS,
 }
 
+JOBSPY_SITES = frozenset(_SITE_MAP)
+
 _EMPLOYMENT_MAP = {
     "full_time": "fulltime",
     "part_time": "parttime",
@@ -68,6 +70,10 @@ class JobSpySource(SourceAdapter):
         )
         if job_type:
             kwargs["job_type"] = job_type
+        if self._site == Site.LINKEDIN and request.extra.get("linkedin_fetch_description"):
+            # One extra request per job, but without it LinkedIn rows carry
+            # no description, so skills and experience cannot be read.
+            kwargs["linkedin_fetch_description"] = True
         try:
             df = jobspy_scrape_jobs(**kwargs)
         except Exception as exc:  # JobSpy boards are flaky by design
@@ -76,38 +82,69 @@ class JobSpySource(SourceAdapter):
             return ()
         out: list[RawJob] = []
         for record in df.to_dict(orient="records"):
-            out.append(_row_to_raw(self.name, record))
+            raw = _row_to_raw(self.name, _drop_missing(record))
+            if raw.title and raw.source_url:
+                out.append(raw)
         return out
 
 
 def _row_to_raw(source: str, record: dict) -> RawJob:
-    description = record.get("description") or ""
-    skills_blob = record.get("skills") or ""
+    description = _clean(record.get("description")) or ""
+    skills_blob = _clean(record.get("skills")) or ""
     skills = tuple(
         sorted({s.strip() for s in skills_blob.split(",") if s.strip()})
     )
     return RawJob(
         source=source,
-        source_id=str(record.get("id")) if record.get("id") else None,
-        title=record.get("title") or "",
-        company=record.get("company"),
-        location=record.get("location"),
+        source_id=_clean(record.get("id")),
+        title=_clean(record.get("title")) or "",
+        company=_clean(record.get("company")),
+        location=_clean(record.get("location")),
         work_arrangement=_work_arrangement(record),
         employment_type=_job_type_from_record(record),
-        seniority=record.get("job_level"),
+        seniority=_clean(record.get("job_level")),
         description=description,
         required_skills=skills,
-        source_url=record.get("job_url") or "",
-        official_url=record.get("company_url"),
-        apply_url=record.get("job_url_direct"),
+        source_url=_clean(record.get("job_url")) or "",
+        # ``company_url`` is the employer's page on the board (e.g. a
+        # LinkedIn company profile), never a link to this vacancy.
+        official_url=_clean(record.get("company_url")),
+        apply_url=_clean(record.get("job_url_direct")),
         date_posted=_parse_date(record.get("date_posted")),
     )
+
+
+def _drop_missing(record: dict) -> dict:
+    """Replace pandas' missing markers (NaN, NaT, None) with ``None``.
+
+    A DataFrame column with gaps hands back ``float('nan')`` — a truthy
+    float — where the board sent nothing, which breaks every string
+    operation downstream.
+    """
+    out = {}
+    for key, value in record.items():
+        try:
+            missing = value is None or bool(value != value)
+        except (TypeError, ValueError):
+            missing = False
+        out[key] = None if missing else value
+    return out
+
+
+def _clean(value: object) -> str | None:
+    """A stripped non-empty string, or ``None``. Non-strings (ids) are stringified."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value != value:
+        return None
+    text = value.strip() if isinstance(value, str) else str(value).strip()
+    return text or None
 
 
 def _work_arrangement(record: dict) -> WorkArrangement:
     if record.get("is_remote") is True:
         return WorkArrangement.REMOTE
-    wfh = (record.get("work_from_home_type") or "").lower()
+    wfh = (_clean(record.get("work_from_home_type")) or "").lower()
     if wfh == "remote":
         return WorkArrangement.REMOTE
     if wfh == "hybrid":
@@ -116,7 +153,7 @@ def _work_arrangement(record: dict) -> WorkArrangement:
 
 
 def _job_type_from_record(record: dict) -> EmploymentType:
-    value = (record.get("job_type") or "").lower()
+    value = (_clean(record.get("job_type")) or "").lower()
     if "full" in value:
         return EmploymentType.FULL_TIME
     if "part" in value:

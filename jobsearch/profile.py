@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from jobsearch.errors import ProfileError
-from jobsearch.resume import ParsedResume, parse_resume
+from jobsearch.resume import (
+    ParsedResume,
+    extract_section_skills,
+    find_skills_heading,
+    parse_resume,
+)
 
 try:  # Python 3.11+
     import tomllib
@@ -36,6 +41,32 @@ DEFAULT_HOURS_OLD = 168  # 7 days
 # means no level-based cutoff; the others are the maximum level the user is
 # willing to consider, evaluated against ``_SENIORITY_RANK`` in matching.
 LEVEL_FILTER_VALUES = frozenset({"off", "intern", "junior", "mid", "senior", "lead", "staff", "principal"})
+LEVEL_VALUES = LEVEL_FILTER_VALUES - {"off"}
+
+# Every site the CLI knows how to query. ``search.sites`` must be a subset.
+KNOWN_SITES = (
+    "linkedin", "indeed", "zip_recruiter", "glassdoor", "google", "bayt",
+    "naukri", "bdjobs", "greenhouse", "lever", "ashby",
+)
+DEFAULT_SITES = ("indeed", "linkedin")
+
+# Fallbacks for ``[verify]``. They describe how job boards behave, not who
+# the candidate is, and every one can be replaced from the profile.
+DEFAULT_VERIFY_UNCERTAIN_HOSTS = (
+    "linkedin.com", "indeed.com", "glassdoor.com", "glassdoor.co.in",
+    "ziprecruiter.com", "naukri.com",
+)
+DEFAULT_VERIFY_LOGIN_MARKERS = ("authwall", "login", "signin", "sign-in", "checkpoint", "captcha")
+DEFAULT_VERIFY_EXPIRED_PHRASES = (
+    "no longer accepting applications",
+    "this job has been filled",
+    "this position has been closed",
+    "this posting has expired",
+    "this vacancy is no longer available",
+    "this job is no longer available",
+    "job not found",
+)
+REPORT_SEEN_MODES = frozenset({"full", "compact", "hide"})
 
 
 @dataclass
@@ -47,13 +78,26 @@ class CandidateProfile:
     skills: tuple[str, ...] = ()
     exclude_keywords: tuple[str, ...] = ()
     level_filter: str = "off"  # off | intern | junior | mid | senior | lead | staff | principal
+    level_min: str = "off"  # floor: jobs whose inferred level ranks below are dropped
+    # true = keep a job only with positive evidence it sits inside the band
+    # (a level word, the board's level field, or a years requirement within
+    # ``max_required_years``); jobs that state nothing are dropped.
+    level_strict: bool = False
     location: str = ""
+    # Every location searched; ``location`` is the first one. Sources that
+    # ignore location (ATS feeds) run once regardless.
+    locations: tuple[str, ...] = ()
+    # Local location filter: a job is kept when its location names one of
+    # these (whole token). Empty = keep every location.
+    allowed_regions: tuple[str, ...] = ()
+    keep_remote: bool = True
+    keep_unknown_location: bool = True
     country: str = "USA"
     remote_preference: str = "any"  # onsite | remote | hybrid | any
     employment_types: tuple[str, ...] = ("full_time",)
     hours_old: int = DEFAULT_HOURS_OLD
     results_per_site: int = 30
-    experience_years: int | None = None
+    experience_years: float | None = None
     min_score: float = 0.0
     llm_provider: str | None = None
     llm_model: str | None = None
@@ -61,6 +105,28 @@ class CandidateProfile:
     indeed_date_filter: bool = False
     resume: ParsedResume | None = None
     raw_queries: dict[str, str] = field(default_factory=dict)
+    # Query terms (``keywords.core``). Kept apart from ``skills`` because the
+    # matcher wants the full résumé skill list but queries must stay short.
+    core_keywords: tuple[str, ...] = ()
+    # Technologies the candidate tracks but does not have. Found in a
+    # posting, they count as required-and-missing.
+    watch_skills: tuple[str, ...] = ()
+    exclude_stack: tuple[str, ...] = ()
+    candidate_level: str | None = None
+    max_required_years: float | None = None
+    level_aliases: dict[str, str] = field(default_factory=dict)
+    sites: tuple[str, ...] = DEFAULT_SITES
+    retries: int = 1
+    retry_backoff_seconds: float = 12.0
+    parallel_sources: int = 1
+    linkedin_fetch_description: bool = False
+    verify_enabled: bool = True
+    verify_workers: int = 8
+    verify_timeout: float = 8.0
+    verify_uncertain_hosts: tuple[str, ...] = DEFAULT_VERIFY_UNCERTAIN_HOSTS
+    verify_login_markers: tuple[str, ...] = DEFAULT_VERIFY_LOGIN_MARKERS
+    verify_expired_phrases: tuple[str, ...] = DEFAULT_VERIFY_EXPIRED_PHRASES
+    report_seen: str = "compact"  # full | compact | hide
 
     def all_titles(self) -> tuple[str, ...]:
         """Primary plus alternative titles — order-preserving, deduped."""
@@ -109,7 +175,34 @@ def load_profile(resume_path: Path) -> CandidateProfile:
 
     profile = _build_profile(data)
     profile.resume = _maybe_parse_resume(resume_path, data)
+    profile.skills = _merge_skills(profile.skills, _resume_skills(text, data))
     return profile
+
+
+def _resume_skills(text: str, data: dict[str, Any]) -> tuple[str, ...]:
+    """Skills listed in the résumé prose, per ``skills.resume_section``.
+
+    ``resume_section`` names the ``## `` heading to read. Omitted, the
+    first heading containing "skill" is used; ``""`` disables it.
+    """
+    section = data.get("skills", {}).get("resume_section")
+    if section is None:
+        section = find_skills_heading(text, exclude=("Job Search Profile",))
+    if not section:
+        return ()
+    return extract_section_skills(text, section)
+
+
+def _merge_skills(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in groups:
+        for skill in group:
+            key = skill.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(skill.strip())
+    return tuple(out)
 
 
 def _maybe_parse_resume(resume_path: Path, data: dict[str, Any]) -> ParsedResume | None:
@@ -138,7 +231,15 @@ def _build_profile(data: dict[str, Any]) -> CandidateProfile:
     if not primary.strip():
         raise ProfileError("titles.primary: must not be empty")
 
-    location = _require_str(data, ("search", "location"), "a string")
+    search_raw = data.get("search") or {}
+    locations = _opt_list(search_raw, "locations", ())
+    if locations:
+        location = locations[0]
+    else:
+        location = _require_str(data, ("search", "location"), "a string")
+        locations = (location,)
+    if not all(loc.strip() for loc in locations):
+        raise ProfileError("search.locations: entries must be non-empty strings")
 
     core_keywords = _require_list(data, ("keywords", "core"), "a list of strings")
     if len(core_keywords) < 2:
@@ -177,7 +278,62 @@ def _build_profile(data: dict[str, Any]) -> CandidateProfile:
     ):
         raise ProfileError("titles.also: must be a list of strings")
 
-    experience_years = _opt_int(data.get("experience") or {}, "years", None)
+    experience = data.get("experience") or {}
+    experience_years = _opt_number(experience, "years", None)
+    max_required_years = _opt_number(experience, "max_required_years", None)
+    candidate_level = _opt_str(experience, "level", None)
+    if candidate_level is not None and candidate_level not in LEVEL_VALUES:
+        raise ProfileError(
+            f"experience.level: expected one of {', '.join(sorted(LEVEL_VALUES))}, "
+            f"got '{candidate_level}'"
+        )
+
+    keywords = data.get("keywords") or {}
+    exclude_stack = _opt_list(keywords, "exclude_stack", ())
+
+    skills_section = data.get("skills") or {}
+    extra_skills = _opt_list(skills_section, "also", ())
+    watch_skills = _opt_list(skills_section, "watch", ())
+
+    levels = data.get("levels") or {}
+    level_aliases = levels.get("aliases") or {}
+    if not isinstance(level_aliases, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in level_aliases.items()
+    ):
+        raise ProfileError("levels.aliases: must be a table of \"phrase\" = \"level\"")
+    bad_levels = {v for v in level_aliases.values() if v not in LEVEL_VALUES | {"ignore"}}
+    if bad_levels:
+        raise ProfileError(
+            f"levels.aliases: unknown level(s) {sorted(bad_levels)}; "
+            f"use one of {', '.join(sorted(LEVEL_VALUES))} or 'ignore'"
+        )
+
+    sites = _opt_list(search, "sites", DEFAULT_SITES)
+    unknown_sites = [s for s in sites if s not in KNOWN_SITES]
+    if unknown_sites or not sites:
+        raise ProfileError(
+            f"search.sites: unknown or empty {unknown_sites}. Valid: {', '.join(KNOWN_SITES)}"
+        )
+    retries = _opt_int(search, "retries", 1)
+    if retries < 0:
+        raise ProfileError("search.retries: must be >= 0")
+    retry_backoff = _opt_number(search, "retry_backoff_seconds", 12.0)
+    parallel_sources = _opt_int(search, "parallel_sources", 1)
+    if parallel_sources < 1:
+        raise ProfileError("search.parallel_sources: must be >= 1")
+
+    verify = data.get("verify") or {}
+    verify_workers = _opt_int(verify, "workers", 8)
+    if verify_workers < 1:
+        raise ProfileError("verify.workers: must be >= 1")
+
+    report_section = data.get("report") or {}
+    report_seen = _opt_str(report_section, "previously_seen", "compact")
+    if report_seen not in REPORT_SEEN_MODES:
+        raise ProfileError(
+            f"report.previously_seen: expected one of {', '.join(sorted(REPORT_SEEN_MODES))}, "
+            f"got '{report_seen}'"
+        )
     min_score = _opt_float(data.get("matching") or {}, "min_score", 0.0)
     llm_provider = _opt_str(data.get("llm") or {}, "provider", None)
     llm_model = _opt_str(data.get("llm") or {}, "model", None)
@@ -191,14 +347,55 @@ def _build_profile(data: dict[str, Any]) -> CandidateProfile:
             f"keywords.level_filter: expected one of "
             f"{', '.join(sorted(LEVEL_FILTER_VALUES))}, got '{level_filter}'"
         )
+    level_min = _opt_str(data.get("keywords") or {}, "level_min", "off") or "off"
+    if level_min not in LEVEL_FILTER_VALUES:
+        raise ProfileError(
+            f"keywords.level_min: expected one of "
+            f"{', '.join(sorted(LEVEL_FILTER_VALUES))}, got '{level_min}'"
+        )
+    from jobsearch.filtering import SENIORITY_RANK
+
+    if (
+        level_min != "off" and level_filter != "off"
+        and SENIORITY_RANK[level_min] > SENIORITY_RANK[level_filter]
+    ):
+        raise ProfileError(
+            f"keywords.level_min ('{level_min}') is above keywords.level_filter ('{level_filter}')"
+        )
 
     return CandidateProfile(
         primary_title=primary.strip(),
         alternative_titles=tuple(t.strip() for t in alt_titles if t.strip()),
-        skills=tuple(k.strip() for k in core_keywords if k.strip()),
+        skills=_merge_skills(
+            tuple(k.strip() for k in core_keywords if k.strip()), extra_skills
+        ),
+        core_keywords=tuple(k.strip() for k in core_keywords if k.strip()),
+        watch_skills=_merge_skills(watch_skills),
+        exclude_stack=tuple(e.strip() for e in exclude_stack if e.strip()),
+        candidate_level=candidate_level,
+        max_required_years=max_required_years,
+        level_aliases={k.strip().lower(): v for k, v in level_aliases.items()},
+        sites=tuple(sites),
+        retries=retries,
+        retry_backoff_seconds=float(retry_backoff),
+        linkedin_fetch_description=_opt_bool(search, "linkedin_fetch_description", False),
+        verify_enabled=_opt_bool(verify, "enabled", True),
+        verify_workers=verify_workers,
+        verify_timeout=float(_opt_number(verify, "timeout", 8.0)),
+        verify_uncertain_hosts=_opt_list(verify, "uncertain_hosts", DEFAULT_VERIFY_UNCERTAIN_HOSTS),
+        verify_login_markers=_opt_list(verify, "login_markers", DEFAULT_VERIFY_LOGIN_MARKERS),
+        verify_expired_phrases=_opt_list(verify, "expired_phrases", DEFAULT_VERIFY_EXPIRED_PHRASES),
+        report_seen=report_seen,
         exclude_keywords=tuple(e.strip() for e in exclude if e.strip()),
         level_filter=level_filter,
+        level_min=level_min,
+        level_strict=_opt_bool(data.get("keywords") or {}, "level_strict", False),
         location=location,
+        locations=tuple(loc.strip() for loc in locations),
+        allowed_regions=tuple(r.strip() for r in _opt_list(search, "allowed_regions", ()) if r.strip()),
+        keep_remote=_opt_bool(search, "keep_remote", True),
+        keep_unknown_location=_opt_bool(search, "keep_unknown_location", True),
+        parallel_sources=parallel_sources,
         country=country,
         jobspy_country=_resolve_jobspy_country(country),
         remote_preference=remote,
@@ -209,7 +406,7 @@ def _build_profile(data: dict[str, Any]) -> CandidateProfile:
         min_score=float(min_score),
         llm_provider=llm_provider,
         llm_model=llm_model,
-        indeed_date_filter=bool(search.get("indeed_date_filter", False)),
+        indeed_date_filter=_opt_bool(search, "indeed_date_filter", False),
         raw_queries={k: str(v) for k, v in (data.get("queries") or {}).items()},
     )
 
@@ -274,6 +471,26 @@ def _opt_int(section: dict[str, Any], key: str, default: int | None) -> int | No
         return default
     if isinstance(value, bool) or not isinstance(value, int):
         raise ProfileError(f"{key}: expected an integer, got {type(value).__name__}")
+    return value
+
+
+def _opt_number(section: dict[str, Any], key: str, default: float | None) -> float | None:
+    value = section.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProfileError(f"{key}: expected a number, got {type(value).__name__}")
+    if value < 0:
+        raise ProfileError(f"{key}: must not be negative")
+    return float(value)
+
+
+def _opt_bool(section: dict[str, Any], key: str, default: bool) -> bool:
+    value = section.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ProfileError(f"{key}: expected true or false, got {type(value).__name__}")
     return value
 
 

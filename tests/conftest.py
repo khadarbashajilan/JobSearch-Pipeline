@@ -31,3 +31,12 @@ def temp_db(tmp_path: Path, monkeypatch) -> Path:
     db = tmp_path / "state.db"
     monkeypatch.setenv("JOBSEARCH_DB", str(db))
     return db
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cwd(tmp_path: Path, monkeypatch) -> None:
+    """Run every test from a temp dir so CLI defaults like ``saved/`` never
+    write into the real repository, and point the default database at a
+    temp file so no test touches ``~/.jobsearch/state.db``."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JOBSEARCH_DB", str(tmp_path / "state.db"))
