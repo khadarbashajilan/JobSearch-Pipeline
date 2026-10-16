@@ -32,11 +32,23 @@ also    = ["Generative AI Engineer", "AI Engineer", "LLM Engineer", "Python Deve
 location         = "Bengaluru, India"
 country          = "India"
 hours_old        = 72
-results_per_site = 10
+results_per_site = 30
+remote           = "any"             # onsite | remote | hybrid | any
+employment_types = ["full_time"]     # full_time, part_time, contract, temporary, internship
 
 [keywords]
 core    = ["Python", "FastAPI", "LangChain", "RAG", "LLM", "React"]
 exclude = ["Senior", "Lead", "Principal", "Staff", "Manager"]
+
+[experience]
+years = 4
+
+[matching]
+min_score = 0.0    # jobs below this score are dropped from the report
+
+[llm]
+provider = ""      # optional, reserved for future LLM-assisted matching
+model    = ""
 ```
 
 ### Field semantics
@@ -44,24 +56,30 @@ exclude = ["Senior", "Lead", "Principal", "Staff", "Manager"]
 | Field | Required | Meaning |
 |---|---|---|
 | `titles.primary` | yes | Single best-fit title. Becomes the quoted phrase in the Indeed query and the leading word everywhere else. Pick the title that best matches the bulk of the resume, not the fanciest one. |
-| `titles.also` | no | Alternative titles, for reference and future query fan-out. Not used by the current single-query runtime. Keep it short. |
+| `titles.also` | no | Alternative titles. Folded into the plain query so they actually participate in discovery. Keep it short and ordered by relevance. |
 | `search.location` | yes | Free text, e.g. `"Bengaluru, India"`. Commas are safe — that is the whole reason this is TOML and not comma-split prose. |
-| `search.country` | no | Indeed/Glassdoor country. Must match a `Country` value in `jobspy/model.py` (e.g. `India`, `USA`, `UK`). Defaults to `USA`. Omit for sites that don't need it. |
+| `search.country` | no | JobSpy country. Must match a `Country` value in `jobspy/model.py` (e.g. `India`, `USA`, `UK`). Defaults to `USA`. Omit for sites that don't need it. |
 | `search.hours_old` | no | Keep only jobs posted within N hours. `72` ≈ 3 days. Applied **locally** to `date_posted` for every site, so behaviour is identical across boards. |
-| `search.results_per_site` | no | Target count per site. Default 10. Job boards cap out near 1000 per search. Raise it if post-filtering empties a site — over-fetching is cheap when you filter locally. |
-| `search.indeed_date_filter` | no | Default `false`. When `true`, *also* passes `hours_old` to Indeed's own server-side `dateOnIndeed` filter. That filter works correctly, but it is redundant with the local filter and roughly halves the rows returned in a thin market. Turn it on only to cut fetch volume. |
+| `search.results_per_site` | no | Target count per site. Default 30. Boards cap out near 1000 per search. Raise if post-filtering empties a site — over-fetching is cheap when you filter locally. |
+| `search.remote` | no | `onsite`, `remote`, `hybrid`, or `any`. Used for hard filtering and ranking. Default `any`. |
+| `search.employment_types` | no | Acceptable employment types. Default `["full_time"]`. Used for hard filtering. |
+| `search.indeed_date_filter` | no | Default `false`. When `true`, *also* passes `hours_old` to Indeed's own server-side filter. Off by default because it halves results in a thin market. |
 | `keywords.core` | yes (min 2) | **Ordered by significance.** First 6 feed the plain query. Put the strongest signal first. |
-| `keywords.exclude` | no | Dropped from job **titles** client-side. Applies to every site, LinkedIn included. |
+| `keywords.exclude` | no | Dropped from job **titles** client-side. Applies to every site, LinkedIn included. Whole-word match — `"Java"` will not match `"JavaScript"`. |
+| `experience.years` | no | Years of relevant experience. Used to estimate seniority fit. Optional. |
+| `matching.min_score` | no | Jobs scoring below this (0.0–1.0) are hidden from the report. Default 0.0. |
+| `llm.provider` / `llm.model` | no | Reserved. Currently unused; matching is fully deterministic. Set only when the LLM integration is enabled. |
 | `queries.indeed` | no | Overrides the query sent to Indeed. Omit to derive it. See below. |
 
 ## How the queries are derived
 
-`scrape.py` builds one query per site capability, then filters the combined results
-locally by date and by title.
+`jobsearch/queries.py` builds one query per site capability, then filters the
+combined results locally by date and by title.
 
 **Indeed** — `queries.indeed` if set, otherwise derived as
 `"<titles.primary>" (<core…>) -<exclude…>`.
-**Every other site** — `GenAI Developer Python FastAPI LangChain RAG LLM React`.
+**Every other site** — `titles.primary` + every `keywords.core` entry + every
+`titles.also` entry. Alternative titles do extend the pool.
 
 `keywords.exclude` is deliberately **not** sent to any board as a `-X` term, and the
 date window is applied locally for every site. That is a uniformity choice, not a
@@ -100,21 +118,21 @@ page for Bengaluru, radius 50, `hours_old = 72`.
   to keep one local rule across all sites. `search.indeed_date_filter = true` enables it.
   (An earlier claim that this filter was broken was wrong: it came from throttled
   responses and from comparing runs with different `results_wanted`.)
-- **Dead code, deliberately left alone:** `dateOnIndeed=self.scraper_input.hours_old`
-  passed to `.format()` at `jobspy/indeed/__init__.py:104` does nothing — the GraphQL
-  template has no such placeholder (only `what`, `location`, `cursor`, `filters`).
-  Harmless. Left unpatched to keep the vendored fork clean.
 - **Indeed only accepts one of** `hours_old`, (`job_type` + `is_remote`), `easy_apply`.
 - **Google ignores most parameters** if `google_search_term` is set, so the runtime
   passes `search_term` + `location` + `hours_old` and lets the scraper build the query.
 - **Indeed is intermittently flaky** — identical queries returned 5 rows one minute
-  and 0 the next. `scrape.py` retries a site group once and always reports per-site
-  counts, including zeros, so a blank site is visible rather than silent. An empty
-  Indeed section usually means throttling, not a bad profile.
+  and 0 the next. `jobsearch/scraper.py` retries a site group once and always reports
+  per-site counts, including zeros, so a blank site is visible rather than silent. An
+  empty Indeed section usually means throttling, not a bad profile.
 - **Blocked from many IPs, not broken:** Naukri returns `406 recaptcha required`,
   ZipRecruiter and Bayt return `403`, Glassdoor returns `400`, BDJobs returns nothing.
   Defaults are `indeed,linkedin`. If a user wants another site, expect it may return
   zero rows — check the error log before assuming a profile bug.
+- **Greenhouse, Lever, Ashby** are direct JSON feeds published by each ATS for
+  embedding on company sites. They are not scraped boards; the integration is a single
+  GET against the public URL. They are off by default — set
+  `JOBSEARCH_GREENHOUSE_BOARD=<token>` (or `LEVER`, `ASHBY`) to enable.
 
 ## When to run this skill
 
@@ -152,3 +170,6 @@ profile validation error.
 ```
 
 `--dry-run` is cheap and needs no job board traffic. Use it after every edit.
+
+For full diagnostics, run `./run.sh doctors` — it prints warnings for missing
+`location`, missing `keywords.core`, or empty `titles.also`.

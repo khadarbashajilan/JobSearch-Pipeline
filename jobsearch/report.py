@@ -1,142 +1,171 @@
 """Markdown report rendering.
 
-Builds the grouped report of clickable job links, recording the exact query
-used per site so a thin result set can be diagnosed later by reading which
-query produced it.
+The report is the only artifact a user reads, so it earns a dedicated
+module. It is intentionally text-only — no HTML, no live links to
+private state — and it surfaces every diagnostic honestly, including
+zeros and unverified URLs.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Iterable
 
-from jobspy.model import Site
+from jobsearch.filtering import FilterStats
+from jobsearch.models import (
+    ApplicationStatus,
+    JobMatch,
+    LinkStatus,
+    StoredJob,
+)
+from jobsearch.orchestrate import RunReport
+from jobsearch.profile import CandidateProfile
 
-from jobsearch.scraper import site_counts
 
-
-def md_escape(value: object) -> str:
-    """Escape a value for safe use inside a markdown line.
-
-    Job titles and company names come from scraped HTML, so they routinely
-    contain [ and ] which would otherwise be read as a link by any markdown
-    renderer. Backslashes are escaped first so the added backslashes are not
-    themselves re-escaped.
-    """
+def _md_escape(value: object) -> str:
+    """Escape a value for safe use inside a markdown line."""
     if value is None:
         return ""
     text = str(value).replace("\n", " ").replace("\r", " ")
     return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
-def cell(value: object) -> str:
-    """Render one dataframe cell as markdown-safe text.
-
-    Missing values come back as None or NaN depending on the column dtype, and
-    str(NaN) is the literal "nan", so both are normalized to an empty string
-    here rather than leaking "nan" into the report.
-    """
+def _cell(value: object) -> str:
+    """Render a dataframe/cell-typed value as markdown-safe text."""
     if value is None:
         return ""
-    try:
-        if value != value:
-            return ""
-    except TypeError:
-        pass
-    return md_escape(value).strip()
+    if isinstance(value, float) and value != value:
+        return ""
+    return _md_escape(value).strip()
 
 
-def render(df, cfg: dict, queries_by_site: dict[str, str], stats: dict) -> str:
-    """Build the markdown report.
+def _format_date(value) -> str:
+    if not value:
+        return "unknown"
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    return _cell(value)
 
-    The report records the exact query used per site alongside the links, so a
-    thin result set can be diagnosed later by reading which query produced it —
-    the file doubles as a record of what was searched.
-    """
+
+def render(
+    matches: list[JobMatch],
+    profile: CandidateProfile,
+    report: RunReport,
+    filter_stats: FilterStats,
+    previously_seen_ids: Iterable[str] = (),
+) -> str:
+    """Build a ranked Markdown shortlist with diagnostics."""
     stamp = datetime.now()
-    header = f"**Location:** {cfg['location']} · **Country:** {cfg['country']}"
-    if cfg["hours_old"]:
-        header += f" · **Freshness:** last {cfg['hours_old']}h"
-
-    lines = [
-        f"# Job Links — {stamp:%Y-%m-%d %H:%M}",
+    seen_ids = set(previously_seen_ids)
+    lines: list[str] = [
+        f"# Job Search — {stamp:%Y-%m-%d %H:%M}",
         "",
-        header,
+        f"**Location:** {_cell(profile.location)} · **Country:** {_cell(profile.jobspy_country)}",
         "",
-        f"**Sites:** {', '.join(s.value for s in cfg['sites'])}",
+        f"**Titles:** {_cell(profile.primary_title)}"
+        + (f" / alt: {_cell(', '.join(profile.alternative_titles))}" if profile.alternative_titles else ""),
         "",
     ]
 
-    counts = site_counts(df, cfg)
-    empty = [s for s, n in counts.items() if n == 0]
-    lines.append(
-        "**"
-        + " · ".join(f"{s}: {n}" for s, n in counts.items())
-        + f"** — {len(df)} unique jobs"
-    )
-    lines.append("")
+    lines += [
+        f"**Discovered:** {report.discovered} · "
+        f"**Unique:** {report.deduplicated} · "
+        f"**Filtered out:** {report.filtered_out} · "
+        f"**Matched:** {report.matched}",
+        "",
+    ]
 
-    applied = []
-    if cfg["hours_old"]:
-        applied.append(f"last {cfg['hours_old']}h")
-    if cfg["exclude"]:
-        applied.append("dropped " + "/".join(cfg["exclude"]) + " from titles")
+    if report.diagnostics:
+        lines.append("## Source diagnostics")
+        lines.append("")
+        for diag in report.diagnostics:
+            base = f"- `{diag.source}`: {diag.jobs_found} jobs"
+            if diag.error:
+                base += f" — error: {diag.error}"
+            if diag.notes:
+                base += f" ({'; '.join(diag.notes)})"
+            lines.append(base)
+        lines.append("")
+
+    if profile.min_score > 0:
+        applied = [
+            f"minimum score {profile.min_score:.2f}",
+        ]
+    else:
+        applied = []
+    if profile.hours_old:
+        applied.append(f"posted within last {profile.hours_old}h")
+    if profile.exclude_keywords:
+        applied.append("title exclusions: " + ", ".join(profile.exclude_keywords))
     if applied:
-        lines += [f"Filtered locally: {' · '.join(applied)}.", ""]
+        lines.append("**Applied locally:** " + " · ".join(applied))
+        lines.append("")
 
-    if empty:
-        lines += [
-            f"> No results from: {', '.join(empty)}. Job boards throttle and block "
-            "aggressively, so an empty site is often transient — rerun, or check "
-            "`-v 2` for the board's own error.",
-            "",
-        ]
+    if report.queries:
+        lines += ["## Queries", ""]
+        for label, value in report.queries.items():
+            lines.append(f"- `{label}` → `{value}`")
+        lines.append("")
 
-    lines += ["## Queries", ""]
-    for site in cfg["sites"]:
-        lines.append(f"- `{site.value}` → `{queries_by_site[site.value]}`")
-    lines.append("")
-    if Site.INDEED in cfg["sites"]:
+    visible = [m for m in matches if m.score >= profile.min_score]
+    if not visible:
         lines += [
-            "> The date window and exclude words above are applied **locally**, to "
-            "every site. LinkedIn ignores `-X` terms outright, and on Indeed each "
-            "exclusion sharply narrows an already thin pool — so job titles are "
-            "filtered here instead. If Indeed looks thin, widen `queries.indeed` in "
-            "resume.md; that is the knob that opens the pool up.",
+            "## No matching jobs",
             "",
-        ]
-
-    if df.empty:
-        lines += [
-            "## No results",
-            "",
-            "Every requested site returned nothing. Common causes, in order of "
-            "likelihood: the query is too narrow for this location, Indeed throttled "
-            "you, or the board is blocking this IP (Naukri 406, ZipRecruiter/Bayt 403, "
-            "Glassdoor 400, BDJobs empty).",
+            "Either no source returned anything, or every job was filtered out.",
         ]
         return "\n".join(lines) + "\n"
 
-    for site in sorted(counts):
-        if counts[site] == 0:
-            continue
-        group = df[df["site"] == site]
-        lines.append(f"## {site} ({counts[site]})")
-        lines.append("")
-        for _, row in group.iterrows():
-            title = cell(row.get("title")) or "untitled"
-            url = cell(row.get("job_url"))
-            lines.append(f"- [{title}]({url})")
-            bits = [
-                b for b in (cell(row.get("company")), cell(row.get("location"))) if b
-            ]
-            posted = cell(row.get("date_posted"))
-            if bits:
-                lines.append(
-                    f"  {' · '.join(bits)}" + (f" · {posted}" if posted else "")
-                )
-            elif posted:
-                lines.append(f"  {posted}")
-            lines.append("")
+    lines.append(f"## Ranked shortlist ({len(visible)})")
+    lines.append("")
+    for index, match in enumerate(visible, start=1):
+        job = match.job
+        lines.extend(_render_job(index, job, match, match.job.id in seen_ids))
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_job(
+    index: int, job: StoredJob, match: JobMatch, is_returning: bool
+) -> list[str]:
+    title = _cell(job.title) or "untitled"
+    url = job.apply_url or job.official_url or job.source_url
+    heading = f"### {index}. [{title}]({_cell(url)})" if url else f"### {index}. {title}"
+
+    bits: list[str] = [heading]
+    sub_bits = []
+    if job.company:
+        sub_bits.append(_cell(job.company))
+    if job.location:
+        sub_bits.append(_cell(job.location))
+    if job.date_posted:
+        sub_bits.append("posted " + _format_date(job.date_posted))
+    elif job.date_posted is None and (job.first_seen):
+        sub_bits.append("posted date unknown")
+    if sub_bits:
+        bits.append(" · ".join(sub_bits))
+
+    bits.append(f"**Score:** {match.score:.2f}")
+    if match.hard_conflicts:
+        bits.append("⚠ **Hard conflict:** " + "; ".join(match.hard_conflicts))
+    if match.explanation:
+        bits.append(f"_{match.explanation}_")
+
+    if match.matched_skills:
+        bits.append(f"- matched: {', '.join(match.matched_skills)}")
+    if match.missing_skills:
+        bits.append(f"- missing: {', '.join(match.missing_skills)}")
+
+    bits.append(f"- source: `{job.source}` · verification: `{job.link_status.value}`")
+    if job.link_evidence:
+        bits.append(f"- link evidence: {_cell(job.link_evidence)}")
+    if job.apply_url and job.apply_url != job.source_url:
+        bits.append(f"- apply URL: {_cell(job.apply_url)}")
+    elif job.source_url:
+        bits.append(f"- source URL: {_cell(job.source_url)}")
+    if job.application_status != ApplicationStatus.NEW:
+        bits.append(f"- application status: `{job.application_status.value}`")
+    if is_returning:
+        bits.append("- previously seen")
+    return bits

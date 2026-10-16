@@ -1,35 +1,18 @@
 # JobSearch-Pipeline
 
 Job boards are flaky. Each one searches differently, filters differently, and
-quietly returns nothing when it's throttling you. This project wraps that behind
-one command: read what you want from a profile, ask each board in the way that
-board understands, filter everything once on your machine, and hand you a
-markdown list of links.
+quietly returns nothing when it's throttling you. This project wraps that
+behind one command: read what you want from a profile, ask each board in the
+way that board understands, filter once on your machine, and hand you a
+markdown list of links — ranked by how well each role matches the résumé.
 
-Scraping itself is handled by the open-source
-[JobSpy](https://github.com/cullenwatson/JobSpy) library (MIT, by Cullen Watson).
-Everything in this repo that is **not** `jobspy/` is the layer I built on top of
-it: profile parsing, query derivation, local filtering, retries, and reporting.
-`resume.md` and `run.sh` are mine too.
-
-## The rules I built around
-
-The code follows five plain rules. Everything else follows from them.
-
-1. **One config file drives everything.** The search profile lives in a TOML
-   block inside `resume.md` — one editable source of truth for titles, location,
-   keywords, freshness, and per-site query overrides. No hardcoding, no guessing
-   at runtime.
-2. **Fail fast.** A malformed profile dies in milliseconds with a clear message,
-   before any network call. `--dry-run` prints the derived queries and exits —
-   so checking a profile edit is free.
-3. **Measure before deciding.** Every claim in the [What I found](#what-i-found-and-what-i-did-about-it)
-   section was tested against the live boards, not assumed.
-4. **Filter once, locally.** Boards can't filter consistently — LinkedIn ignores
-   exclusions, Indeed over-applies them. So one rule runs on your machine and
-   every board behaves the same.
-5. **Make output self-explanatory.** Each report records the exact query used per
-   site, so a thin result set is easy to diagnose later instead of a mystery.
+Scraping is handled by the open-source
+[JobSpy](https://github.com/cullenwatson/JobSpy) library (MIT, by Cullen
+Watson) for board scraping, and by direct ATS adapters for Greenhouse,
+Lever, and Ashby. Everything in this repo that is **not** `jobspy/` is the
+layer built on top: profile parsing, query derivation, local filtering,
+matching, deduplication, link verification, persistence, and reporting.
+`resume.md` and `run.sh` are yours to edit.
 
 ## How it works
 
@@ -37,41 +20,42 @@ The code follows five plain rules. Everything else follows from them.
 flowchart TD
     A["resume.md (toml profile)"] --> B["load_profile + validate"]
     B -->|"fail fast on a bad profile"| C["build_queries"]
-    C -->|"boolean query for Indeed, plain keywords elsewhere"| D["scrape_all"]
-    D -->|"one concurrent call per query form, retry + dedup"| E["post_filter"]
-    E -->|"date window + title exclusions, applied locally"| F["render"]
-    F --> G["saved/job-links-<timestamp>.md"]
+    C -->|"boolean query for Indeed, plain keywords elsewhere"| D["discover (JobSpy boards + ATS adapters)"]
+    D -->|"per-source diagnostics, retry on empty"| E["dedupe (URL + ATS id + identity)"]
+    E -->|"date window + title exclusions, applied locally"| F["match (deterministic scoring)"]
+    F -->|"score, evidence, hard conflicts"| G["verify (URL reachable, not expired)"]
+    G --> H["render ranked Markdown shortlist"]
+    H --> I["saved/job-links-<timestamp>.md"]
+    F --> J["SQLite store (history + application status)"]
 ```
 
 | Step | What it does | Why |
 |---|---|---|
-| `load_profile` + `validate` | Extract and type-check the TOML block from `resume.md` | Rule 2: fail fast with an actionable message |
-| `build_queries` | One query per board — boolean for Indeed, plain keywords for the rest | Boards parse queries differently |
-| `scrape_all` | Scrape, retry on empty, dedup on `job_url` | Boards throttle by returning nothing |
-| `post_filter` | Date window + title exclusions, applied once, locally | Rule 4: one rule, every site |
-| `render` | Markdown report of clickable links | Rule 5: records its own queries |
+| `load_profile` + `validate` | Extract and type-check the TOML block from `resume.md` | Fail fast with an actionable message |
+| `build_queries` | Boolean query for Indeed, plain keywords for every other site | Boards parse queries differently |
+| Source adapters | JobSpy boards, plus Greenhouse / Lever / Ashby ATS feeds | ATS feeds give employer-authoritative data without scraping |
+| `dedupe` | Match on canonical URL, then on ATS id, then on normalized identity | Tracking redirects and syndicated postings should not double-count |
+| `filter_jobs` | Date window + whole-token title exclusions, applied locally | LinkedIn ignores `-X`; Indeed over-applies them |
+| `match_job` | Score each job on skills, title, seniority, location, employment, experience | One documented formula, applied to every source |
+| `verify_url` | HEAD/GET with SSRF guard, expiration text scan, redirect validation | Never label an unverified URL as verified |
+| `render` | Ranked Markdown shortlist with score, evidence, and verification status | Self-explanatory output for Obsidian or any markdown viewer |
+| `store.upsert_jobs` | SQLite-backed history and application status | Track what you have already considered |
 
-## Usage
+## Quick start
 
 ```bash
-./run.sh                # scrape using the profile in resume.md
-./run.sh --dry-run      # print the derived queries, scrape nothing
+./run.sh                  # discover + rank jobs
+./run.sh --dry-run        # print the profile and derived queries, scrape nothing
 ./run.sh --site indeed,linkedin --results 50
+./run.sh search --site greenhouse,lever,ashby
+./run.sh list --status new
+./run.sh status <job-id> applied
+./run.sh inspect          # show the parsed profile as JSON
+./run.sh doctors          # run configuration diagnostics
 ```
 
-Requires Python 3.11+ (the profile parser uses the standard library `tomllib`).
-`run.sh` creates the virtualenv and installs the package on first run. Reports
-are written to `saved/job-links-<timestamp>.md`.
-
-| Flag | Effect |
-|---|---|
-| `--dry-run` | Print the profile and derived queries, then exit without scraping |
-| `--site` | Comma-separated sites (default `indeed,linkedin`) |
-| `--location` / `--country` | Override the profile's search location |
-| `--results` | Override `results_per_site` |
-| `--hours-old` | Override the freshness window |
-| `--retries` | Retry count for a site group returning nothing (default 1) |
-| `-v 0\|1\|2` | Verbosity: errors only / +warnings / all logs |
+`run.sh` bootstraps the virtualenv with `uv` and installs the local package
+on first run. After that, every invocation is `python -m jobsearch ...`.
 
 ## The profile
 
@@ -83,93 +67,137 @@ primary = "GenAI Developer"
 also    = ["Generative AI Engineer", "AI Engineer"]
 
 [search]
-location         = "Bengaluru, India"
-country          = "India"
-hours_old        = 72
-results_per_site = 30
-indeed_date_filter = false
+location            = "Bengaluru, India"
+country             = "India"
+hours_old           = 72
+results_per_site    = 30
+remote              = "any"           # onsite | remote | hybrid | any
+employment_types    = ["full_time"]   # full_time, part_time, contract, internship, temporary
 
 [keywords]
-core    = ["Python", "FastAPI", "LangChain", "RAG", "LLM", "React"]
+core    = ["Python", "FastAPI", "LangChain", "RAG", "LLM"]
 exclude = ["Senior", "Lead", "Principal", "Staff", "Manager"]
 
-[queries]
-indeed = '"Gen AI" (Python OR FastAPI OR LLM)'
+[experience]
+years = 4
+
+[matching]
+min_score = 0.0
+
+[llm]
+provider = ""      # optional, reserved for future LLM-assisted matching
+model    = ""
 ```
 
-| Field | Required | Meaning |
-|---|---|---|
-| `titles.primary` | yes | Best-fit title. Becomes the quoted phrase in the Indeed query |
-| `titles.also` | no | Alternative titles, for reference |
-| `search.location` | yes | Free text; commas are safe because it is TOML |
-| `search.country` | no | Indeed/Glassdoor country. Must match a `Country` value |
-| `search.hours_old` | no | Keep jobs posted within N hours. Applied locally |
-| `search.results_per_site` | no | Target count per site (default 10) |
-| `search.indeed_date_filter` | no | Also pass the window to Indeed's own filter. Off by default |
-| `keywords.core` | yes (min 2) | Ordered by significance. First 6 reach the query |
-| `keywords.exclude` | no | Dropped from job titles locally, on every site |
-| `queries.indeed` | no | Overrides the derived Indeed query |
+The full profile contract is documented at
+`.opencode/skills/job-search-profile/SKILL.md`.
 
-TOML rather than comma-separated prose because values legitimately contain
-commas (`location = "Bengaluru, India"`) and quotes.
+## Sources
 
-### Maintaining the profile
+- **Boards** (via JobSpy): LinkedIn, Indeed, ZipRecruiter, Glassdoor, Google,
+  Bayt, Naukri, BDJobs.
+- **ATS feeds** (direct, public): Greenhouse, Lever, Ashby. Configure each
+  board token via the corresponding environment variable:
 
-The repo ships an [opencode](https://opencode.ai) skill at
-`.opencode/skills/job-search-profile/SKILL.md` that keeps the TOML profile in
-sync with your actual resume. Ask opencode to *"update my job search profile"*
-and it reads `resume.md`, rewrites **only** the toml block, never invents skills
-the resume doesn't evidence, and reports the exact queries the change will
-produce. Verify with `./run.sh --dry-run`. `resume.md` itself is gitignored
-(contact details), but the skill file documents the full profile contract.
+  ```bash
+  export JOBSEARCH_GREENHOUSE_BOARD=stripe
+  export JOBSEARCH_LEVER_BOARD=netflix
+  export JOBSEARCH_ASHBY_BOARD=openai
+  ```
 
-## What I found, and what I did about it
+  Each ATS adapter issues a single GET against the public feed and tolerates
+  schema drift. Optional — leave the token unset to disable the source.
 
-Measured against the live boards, not assumed. Same title and window, Bengaluru,
-radius 50, `hours_old = 72`.
+ATS adapters never bypass authentication, captchas, or anti-bot systems.
+They consume the public, employer-published feeds that each ATS exposes
+specifically for this purpose.
 
-| What I saw | What I did | What it cost |
-|---|---|---|
-| LinkedIn ignores `-Senior` — senior jobs still show up | Drop those words from titles myself | Titles are filtered, not the query |
-| On Indeed, exclusions work but 5 of them cut 8 results to 1 | Never send exclusions to Indeed; filter locally | More results to skim |
-| Boards "throttle" by returning nothing, not an error | Retry once, waiting 12s, when a site group comes back empty | Up to 12s slower worst-case |
-| The same Indeed query gave 5 results one minute, 0 the next | Report every site's count, including zeros | A blank site is visible, not silent |
-| Indeed's own date filter works but halves results in a thin market | Leave it off; one local rule covers all sites | Larger fetch volume |
+## Data and privacy
 
-The exclusion numbers, for the record:
+- The SQLite store lives at `~/.jobsearch/state.db` by default. Override
+  with `JOBSEARCH_DB=/path/to/state.db`. Reports land in `saved/`.
+- `resume.md` is gitignored. The DB stores **no résumé content** — only the
+  normalized job records the pipeline produces.
+- The optional LLM provider, when used, would receive job descriptions and
+  the candidate's skills. It is not configured by default and is reserved
+  for future semantic matching. Add credentials only when you choose to
+  enable it.
 
-| query | rows | senior |
-|---|---|---|
-| `GenAI Developer` | 9 | 5 |
-| + 3 `OR` terms | 8 | 4 |
-| + 6 `OR` terms | 8 | 4 |
-| + 6 `OR` terms + 5 excludes | **1** | **0** |
+## Verification and matching
 
-The exclusions did exactly what they should — zero senior rows — but five of
-them turned 8 rows into 1. That's the whole argument for filtering locally.
+Each job carries an explicit verification status:
 
-Also measured: Indeed's `OR` group barely matters (0 / 1 / 3 / 6 terms gave
-9 / 8 / 8 / 8 rows), so it isn't worth lengthening. And some boards are blocked
-from many IPs rather than broken — Naukri `406`, ZipRecruiter/Bayt `403`,
-Glassdoor `400`, BDJobs empty — which is why the defaults are `indeed,linkedin`.
+- `verified` — URL resolved, the page corresponds to the vacancy.
+- `unverified` — not yet checked (the default for stored jobs).
+- `expired` — body text indicates the role is closed.
+- `unreachable` — network or HTTP failure.
+- `uncertain` — reachable but evidence was ambiguous.
 
-## What I deliberately left out
+HTTP 200 alone is **not** proof that a job is open. A generic employer
+career page is **not** a direct application link. The report reflects
+that distinction.
 
-- **No web app.** A CLI is the right size for a daily personal workflow; a UI
-  adds surface area without adding signal.
-- **No database.** Runs are stateless. Tracking "what's new since yesterday"
-  across runs is the planned next step, not this version.
-- **I didn't write the scrapers.** I grouped calls by query form to use the
-  library's concurrency well, instead of re-inventing a thread pool.
+The matching formula is documented in `jobsearch/matching.py`:
 
-## Next steps
+- Skill overlap (40%) — share of the job's required skills present in the
+  candidate's skills. Neutral when the job did not list required skills.
+- Title alignment (20%) — substring / token overlap between the job
+  title and the candidate's primary + alternative titles.
+- Seniority (15%) — `unknown` is neutral; we never penalise the
+  candidate for an unstated requirement.
+- Location (10%) — preference match against the job's stated work mode.
+- Employment type (10%) — intersection with the candidate's acceptable
+  types; `unknown` is neutral.
+- Experience (5%) — years of experience vs. the job's stated minimum.
 
-1. Add a SQLite store so each run can flag jobs that are new since the last one.
-2. Smarter retries — jittered backoff and per-IP user-agent rotation.
-3. A scheduled digest (cron + email) of fresh roles.
+Hard conflicts (e.g. on-site-only role when the candidate wants remote)
+short-circuit to score 0 and are surfaced in the report.
 
-## Credits
+## CLI commands
 
-Board scraping comes from [JobSpy](https://github.com/cullenwatson/JobSpy) by
-Cullen Watson and contributors, MIT licensed. The automation layer in
-`jobsearch/` is also released under the MIT license. See `LICENSE`.
+```bash
+# Run a search
+./run.sh                                       # default sites, default profile
+./run.sh search --site indeed,linkedin         # explicit subcommand
+./run.sh --dry-run                             # show what *would* be searched
+
+# Inspect, diagnose
+./run.sh inspect                               # JSON of the parsed profile
+./run.sh doctors                               # configuration warnings
+
+# Persistence
+./run.sh list                                  # show new jobs (default)
+./run.sh list --status applied                 # show jobs already applied to
+./run.sh status <job-id> applied               # mark a job as applied
+./run.sh status <job-id> interview --note "phone screen"
+```
+
+## Testing
+
+```bash
+.venv/bin/pytest tests/ -v
+```
+
+The suite is fully deterministic — every adapter, matcher, and storage
+call uses fixtures or mocked HTTP. It does not require live job boards.
+
+## Known limitations
+
+- ATS adapters require a `JOBSEARCH_<NAME>_BOARD` token for each source
+  the user wants enabled. The boards listed above are documentation, not
+  default values.
+- The optional LLM provider is not yet wired to matching; deterministic
+  rules handle all current ranking. The profile fields exist so the
+  integration can be added without a profile schema change.
+- Live board scraping depends on each board's tolerance for automated
+  access. Naukri, ZipRecruiter, and Glassdoor are frequently blocked
+  from many IPs — failures surface as `SourceDiagnostic.error` in the
+  report rather than as silent drops.
+- No paid job-board API is required. Optional integrations stay disabled
+  when credentials are missing.
+
+## License
+
+Board scraping comes from [JobSpy](https://github.com/cullenwatson/JobSpy)
+by Cullen Watson and contributors, MIT licensed. The automation layer in
+`jobsearch/` is released under the same MIT license. See `LICENSE`.

@@ -1,93 +1,54 @@
-"""Query and config derivation from the profile.
+"""Query derivation from a :class:`CandidateProfile`.
 
-Turns the profile into one query per site capability, and merges CLI overrides
-over profile values into a single flat config dict.
+Boards parse queries differently. Indeed understands boolean operators;
+LinkedIn and the rest treat the search box as plain text. This module
+produces one query per capability so the scraper can group sites by the
+form they accept. Alternative titles are folded into the plain query so
+``titles.also`` actually participates in discovery instead of being
+documentation.
 """
 
 from __future__ import annotations
 
-import argparse
+from jobsearch.profile import CandidateProfile
 
-from jobspy.model import Site
-
-from jobsearch.profile import MAX_CORE_KEYWORDS, ProfileError
+MAX_BOOLEAN_TERMS = 6
 
 
-def build_queries(profile: dict) -> dict[str, str]:
-    """Derive one query per site capability from the profile.
+def build_queries(profile: CandidateProfile) -> dict[str, str]:
+    """Return one query per site capability.
 
-    Two forms come out of this:
+    Returns a dict with two keys:
 
-    "indeed"  — boolean, e.g. '"GenAI Developer" (Python OR FastAPI) -Senior'.
-                Indeed's search engine understands boolean operators; the quoted
-                phrase pins the title and the OR group widens on skills.
-    "plain"   — flat keywords, e.g. "GenAI Developer Python FastAPI ...".
-                Every other board treats its search box as plain text, so sending
-                quotes or OR groups there just narrows the pool for no gain.
-
-    queries.indeed in the profile overrides the derived Indeed query. That is the
-    knob to turn when Indeed returns too few rows.
+    - ``"indeed"``: boolean form, e.g. ``'"GenAI Developer" (Python OR
+      FastAPI OR LLM) -Senior'``.
+    - ``"plain"``: flat keyword string used for every other site. Alternative
+      titles are included here so the search pool widens without exploding.
     """
-    primary = profile["titles"]["primary"].strip()
-    core = [k.strip() for k in profile["keywords"]["core"]][:MAX_CORE_KEYWORDS]
-    exclude = [e.strip() for e in profile.get("keywords", {}).get("exclude", [])]
+    primary = profile.primary_title
+    boolean = f'"{primary}" ({" OR ".join(profile.skills[:MAX_BOOLEAN_TERMS])})'
+    if profile.exclude_keywords:
+        boolean += " " + " ".join(f"-{e}" for e in profile.exclude_keywords)
 
-    # Quoted title + OR-joined skills, then any -X excludes appended.
-    boolean = '"{}" ({})'.format(primary, " OR ".join(core))
-    if exclude:
-        boolean += " " + " ".join(f"-{e}" for e in exclude)
+    plain_terms = [primary, *profile.skills, *profile.alternative_titles]
+    plain = " ".join(dict.fromkeys(t for t in plain_terms if t))
 
-    # A profile-level override wins over the derived form, so the user can widen
-    # the Indeed query without touching keyword ordering.
-    override = (profile.get("queries", {}) or {}).get("indeed")
+    override = profile.raw_queries.get("indeed", "").strip()
     return {
-        "indeed": (
-            override.strip()
-            if isinstance(override, str) and override.strip()
-            else boolean
-        ),
-        "plain": " ".join([primary, *core]),
+        "indeed": override or boolean,
+        "plain": plain,
     }
 
 
-def parse_sites(raw: str) -> list[Site]:
-    """Parse the --site CLI value ("indeed,linkedin") into Site enum members."""
-    sites: list[Site] = []
-    for token in (t.strip() for t in raw.split(",")):
-        if not token:
-            continue
-        try:
-            sites.append(Site[token.upper()])
-        except KeyError:
-            valid = ", ".join(s.value for s in Site)
-            raise ProfileError(
-                f"unknown site '{token}'. valid sites: {valid}"
-            ) from None
-    if not sites:
-        raise ProfileError("--site: no sites given")
-    return sites
-
-
-def resolve(args: argparse.Namespace, profile: dict) -> dict:
-    """Merge CLI overrides over profile values into one flat config dict.
-
-    Precedence: explicit CLI flag > profile in resume.md > hardcoded default.
-    That way the profile is the normal path and the flags are for one-off runs
-    ("just try zip_recruiter today") without editing the file.
-    """
-    search = profile.get("search", {})
-    return {
-        "sites": parse_sites(args.site),
-        "location": args.location or search.get("location"),
-        "country": args.country or search.get("country") or "USA",
-        "hours_old": (
-            args.hours_old if args.hours_old is not None else search.get("hours_old")
-        ),
-        "results": args.results or search.get("results_per_site") or 10,
-        "indeed_date_filter": bool(search.get("indeed_date_filter", False)),
-        "exclude": [
-            e.strip()
-            for e in profile.get("keywords", {}).get("exclude", [])
-            if isinstance(e, str) and e.strip()
-        ],
-    }
+def parse_sites(raw: str) -> list[str]:
+    """Parse the ``--site`` value into a list of normalised site tokens."""
+    tokens = [token.strip().lower() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError("--site: no sites given")
+    valid = {"linkedin", "indeed", "zip_recruiter", "glassdoor", "google", "bayt", "naukri", "bdjobs", "greenhouse", "lever", "ashby"}
+    unknown = [t for t in tokens if t not in valid]
+    if unknown:
+        raise ValueError(
+            f"unknown site(s): {', '.join(unknown)}. Valid: {', '.join(sorted(valid))}"
+        )
+    return tokens

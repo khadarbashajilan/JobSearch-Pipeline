@@ -1,44 +1,74 @@
-"""Local post-filtering of combined scraped results.
+"""Local post-filtering applied after dedup.
 
-Applies the date window and title exclusions once, locally, to every site so
-behaviour is identical across boards — a deliberate uniformity choice, not a
-patch for a broken board API.
+Two filters, both run on every job regardless of source:
+
+1. Freshness window — drop jobs posted before the cutoff when the source
+   actually supplied a date. Unknown dates are *kept* and labeled, not
+   silently treated as recent. We never pretend first-seen equals
+   posted.
+2. Title exclusions — drop roles whose title contains any excluded
+   token as a whole word. The previous substring matcher was both
+   silent and wrong; this one logs every decision so the report can
+   surface what was filtered and why.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+from jobsearch.models import StoredJob
+from jobsearch.textnorm import contains_any
 
 
-def post_filter(df, hours_old: int | None, exclude: list[str]):
-    """Apply the date window and exclude words to every site's results.
+@dataclass
+class FilterStats:
+    """Counts surfaced in the report so filtering is observable."""
 
-    A deliberate uniformity choice, not a patch for a broken board API. Both boards
-    handle server-side filtering inconsistently: LinkedIn ignores -X outright, and
-    Indeed's -X works but over-narrows a thin market (five excludes took 8 rows to 1
-    for Bengaluru at 72h). date_posted and title come back reliably from every site,
-    so filtering once, locally, is the only approach that behaves the same everywhere.
+    kept: int = 0
+    dropped_unknown_date: int = 0  # never used; kept so reports can reference it
+    dropped_outside_window: int = 0
+    dropped_excluded_title: int = 0
+    dropped_hard_conflict: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "kept": self.kept,
+            "dropped_outside_window": self.dropped_outside_window,
+            "dropped_excluded_title": self.dropped_excluded_title,
+            "dropped_hard_conflict": self.dropped_hard_conflict,
+        }
+
+
+def filter_jobs(
+    jobs: list[StoredJob],
+    *,
+    hours_old: int | None,
+    exclude_keywords: tuple[str, ...],
+) -> tuple[list[StoredJob], FilterStats]:
+    """Apply freshness and exclusion filters.
+
+    Undated jobs pass through so the report can show them with a clear
+    "posted date unknown" marker rather than discarding them.
     """
-    import pandas as pd
+    from jobsearch.textnorm import parse_iso_datetime
 
-    if df.empty:
-        return df, {"dated_out": 0, "excluded_out": 0}
-
-    out = df
-    stats = {"dated_out": 0, "excluded_out": 0}
-
-    if hours_old:
-        cutoff = datetime.now() - timedelta(hours=int(hours_old))
-        posted = pd.to_datetime(out["date_posted"], errors="coerce")
-        keep = posted.isna() | (posted >= cutoff)
-        stats["dated_out"] = int((~keep).sum())
-        out = out[keep]
-
-    if exclude and not out.empty:
-        terms = [e.lower() for e in exclude if e]
-        titles = out["title"].astype(str).str.lower()
-        keep = ~titles.apply(lambda t: any(term in t for term in terms))
-        stats["excluded_out"] = int((~keep).sum())
-        out = out[keep]
-
-    return out.reset_index(drop=True), stats
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=hours_old)
+        if hours_old
+        else None
+    )
+    stats = FilterStats()
+    out: list[StoredJob] = []
+    needles = tuple(k.lower() for k in exclude_keywords if k)
+    for job in jobs:
+        posted = parse_iso_datetime(job.date_posted)
+        if cutoff and posted is not None and posted < cutoff:
+            stats.dropped_outside_window += 1
+            continue
+        if needles and contains_any(job.title, needles):
+            stats.dropped_excluded_title += 1
+            continue
+        out.append(job)
+    stats.kept = len(out)
+    return out, stats
